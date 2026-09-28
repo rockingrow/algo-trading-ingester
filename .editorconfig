@@ -1,0 +1,22 @@
+root = true
+
+[*]
+indent_style = space
+indent_size = 2
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+end_of_line = lf
+
+[*.py]
+indent_size = 2
+
+[*.{yml,yaml,json,md}]
+indent_size = 2
+
+[*.toml]
+indent_size = 2
+
+# make requires tab-indented recipes.
+[Makefile]
+indent_style = tab
