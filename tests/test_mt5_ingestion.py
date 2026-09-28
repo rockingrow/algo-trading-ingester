@@ -105,7 +105,7 @@ async def test_initialize_failure_keeps_retrying(terminal):
   ingestion, _, notifier = make_ingestion(terminal)
   await ingestion.start()
   await wait_for(lambda: terminal.initialize_calls >= 3)
-  assert ingestion.status is GatewayStatusEnum.DISCONNECTED
+  await wait_for(lambda: ingestion.status is GatewayStatusEnum.DISCONNECTED)
   terminal.initialize_ok = True
   await wait_for(lambda: ingestion.status is GatewayStatusEnum.RUNNING)
   await ingestion.stop()
@@ -118,7 +118,9 @@ async def test_unknown_symbol_is_skipped_not_fatal(terminal):
   ingestion, publisher, _ = make_ingestion(terminal, SYMBOLS=["NOPE", "XAUUSD"])
   await ingestion.start()
   await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
-  assert ingestion.status is GatewayStatusEnum.RUNNING
+  # Status crosses from the watcher thread via call_soon_threadsafe, so it may
+  # land a moment after the stream is primed.
+  await wait_for(lambda: ingestion.status is GatewayStatusEnum.RUNNING)
   await ingestion.stop()
 
 

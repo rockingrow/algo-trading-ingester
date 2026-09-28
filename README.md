@@ -232,6 +232,9 @@ algo-trading-ingestor/
 │   └── main.py          # Entrypoint (uvicorn)
 ├── examples/nats/       # Example payloads — the contract for qte-ingest
 ├── tests/               # Pytest suite (MT5 faked, runs on any OS)
+├── .claude/             # Claude Code settings + SessionStart hook (uv sync)
+├── AGENTS.md            # Shared instructions for coding agents
+├── CLAUDE.md            # Claude Code specifics (imports AGENTS.md)
 ├── .env.example
 ├── changelog.md
 ├── Makefile
