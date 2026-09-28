@@ -1,12 +1,11 @@
-import pytest
 from fastapi.testclient import TestClient
 
-from ingestor.app import create_app
-from ingestor.core import IngestionFactory
-from ingestor.gateways.mt5 import Mt5Ingestion
-from ingestor.runtime import IngestorRuntime
-from ingestor.schemas import GatewayEnum, Timeframe
-from ingestor.settings import AppSettings, Mt5Settings, Settings
+from ingester.app import create_app
+from ingester.core import IngestionFactory
+from ingester.gateways.mt5 import Mt5Ingestion
+from ingester.runtime import IngesterRuntime
+from ingester.schemas import GatewayEnum, Timeframe
+from ingester.settings import AppSettings, Mt5Settings, Settings
 from tests.fakes import FakeConnection, FakeNotifier, FakePublisher, FakeTerminal, rate
 
 
@@ -36,10 +35,10 @@ def make_runtime_factory(connection: FakeConnection, notifier: FakeNotifier):
       instance_id=ctx.settings.app.instance_id,
     )
 
-  def runtime_factory(config: Settings) -> IngestorRuntime:
+  def runtime_factory(config: Settings) -> IngesterRuntime:
     factory = IngestionFactory()
     factory.register(GatewayEnum.MT5, build)
-    return IngestorRuntime(
+    return IngesterRuntime(
       config,
       factory=factory,
       notifier=notifier,
@@ -67,17 +66,48 @@ def test_lifespan_health_and_status():
 
   assert connection.connected and connection.closed
   assert notifier.started and notifier.stopped
-  assert any("Ingestor Running" in m for m in notifier.messages)
-  assert "Ingestor Stopped" in notifier.messages[-1]
+  assert any("Ingester Running" in m for m in notifier.messages)
+  assert "Ingester Stopped" in notifier.messages[-1]
 
 
-def test_startup_failure_is_notified_and_cleaned_up():
+def test_dead_nats_degrades_instead_of_crashing():
+  # A market-data gateway that exits because NATS blinked drops bars nobody can
+  # get back. It stays up, keeps detecting, and says it is degraded.
   connection, notifier = FakeConnection(fail=True), FakeNotifier()
   app = create_app(make_settings(), make_runtime_factory(connection, notifier))
 
-  with pytest.raises(ConnectionError):
-    with TestClient(app):
-      pass
+  with TestClient(app) as client:
+    assert client.get("/health").status_code == 200
+    (gateway,) = client.get("/status").json()["gateways"]
+    assert gateway["status"] == "running"
 
-  assert any("Failed To Start" in m for m in notifier.messages)
+  assert not connection.connected
+  assert any("Ingester Degraded" in m for m in notifier.messages)
+  assert any("nats down" in m for m in notifier.messages)
   assert notifier.stopped
+
+
+def test_a_gateway_that_will_not_start_does_not_take_the_others_down():
+  connection, notifier = FakeConnection(), FakeNotifier()
+
+  def explode(ctx):
+    raise RuntimeError("terminal missing")
+
+  def runtime_factory(config: Settings) -> IngesterRuntime:
+    factory = IngestionFactory()
+    factory.register(GatewayEnum.MT5, explode)
+    return IngesterRuntime(
+      config,
+      factory=factory,
+      notifier=notifier,
+      connection=connection,
+      publisher=FakePublisher(),
+      subject_filter="TEST.>",
+    )
+
+  app = create_app(make_settings(), runtime_factory)
+  with TestClient(app) as client:
+    assert client.get("/status").json()["gateways"] == []
+
+  assert any("terminal missing" in m for m in notifier.messages)
+  assert connection.closed and notifier.stopped

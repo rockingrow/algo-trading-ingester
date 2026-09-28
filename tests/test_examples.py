@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from ingestor.schemas import BarClosedEvent
+from ingester.schemas import BarClosedEvent
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "nats"
 

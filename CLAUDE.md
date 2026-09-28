@@ -24,12 +24,12 @@ other.
 
 Use plan mode, and confirm the approach, before editing:
 
-- `ingestor/schemas/` — the wire contract `qte-ingest` decodes; a change here
+- `ingester/schemas/` — the wire contract `qte-ingest` decodes; a change here
   is a change for a consumer this repository cannot see.
-- `ingestor/gateways/mt5/{ingestion,dto}.py` — bar-close detection and the
+- `ingester/gateways/mt5/{ingestion,dto}.py` — bar-close detection and the
   server-time → UTC conversion; a mistake here silently drops, duplicates or
   time-shifts the bars strategies trade on.
-- `ingestor/core/ingestion.py` — every gateway inherits it, and it owns the
+- `ingester/core/ingestion.py` — every gateway inherits it, and it owns the
   thread → event-loop hand-off.
 
 ## Session hygiene

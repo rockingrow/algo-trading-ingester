@@ -1,8 +1,8 @@
 import pytest
 
-from ingestor.core import GatewayNotRegisteredError, IngestionContext, IngestionFactory
-from ingestor.schemas import GatewayEnum
-from ingestor.settings import Settings
+from ingester.core import GatewayNotRegisteredError, IngestionContext, IngestionFactory
+from ingester.schemas import GatewayEnum
+from ingester.settings import Settings
 from tests.fakes import FakeNotifier, FakePublisher
 
 
@@ -46,6 +46,6 @@ def test_create_all_deduplicates_in_order(context):
 
 
 def test_default_factory_registers_mt5():
-  from ingestor.providers import make_ingestion_factory
+  from ingester.providers import make_ingestion_factory
 
   assert GatewayEnum.MT5 in make_ingestion_factory().registered

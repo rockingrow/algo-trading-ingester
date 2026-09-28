@@ -1,12 +1,15 @@
 import asyncio
+import logging
+import sys
 
-from ingestor.services.notification_service import (
+from ingester.services.notification_service import (
   ChatTarget,
   QueuedNotifier,
+  TelegramLogHandler,
   TelegramNotifier,
   parse_chat_targets,
 )
-from ingestor.settings import TelegramSettings
+from ingester.settings import TelegramSettings
 from tests.fakes import FakeNotifier
 
 
@@ -83,3 +86,104 @@ async def test_telegram_notifier_posts_to_each_target(monkeypatch):
   assert bodies[1]["message_thread_id"] == 7
   assert all(b["parse_mode"] == "HTML" for b in bodies)
   assert str(requests[0].url) == "https://api.telegram.org/botT/sendMessage"
+
+
+class RecordingNotifier:
+  def __init__(self) -> None:
+    self.messages: list[str] = []
+
+  async def send_message(self, message_text: str) -> None:
+    self.messages.append(message_text)
+
+
+def _handler(notifier, **kwargs):
+  handler = TelegramLogHandler(notifier, instance_id="vps-test", **kwargs)
+  handler.bind(asyncio.get_running_loop())
+  return handler
+
+
+async def _settle():
+  # emit() hops through call_soon_threadsafe, then the send task runs.
+  for _ in range(3):
+    await asyncio.sleep(0)
+
+
+def _record(message: str, *, name: str = "ingester.core.ingestion", exc=None):
+  return logging.LogRecord(
+    name=name,
+    level=logging.ERROR,
+    pathname=__file__,
+    lineno=1,
+    msg=message,
+    args=(),
+    exc_info=exc,
+  )
+
+
+async def test_error_record_is_forwarded_with_context():
+  notifier = RecordingNotifier()
+  _handler(notifier).emit(_record("publish failed"))
+  await _settle()
+
+  (message,) = notifier.messages
+  assert "publish failed" in message
+  assert "ingester.core.ingestion" in message
+  assert "vps-test" in message
+
+
+async def test_identical_errors_are_deduplicated_inside_the_window():
+  notifier = RecordingNotifier()
+  handler = _handler(notifier, dedup_window=60.0)
+  for _ in range(5):
+    handler.emit(_record("NATS error: connection refused"))
+  await _settle()
+  assert len(notifier.messages) == 1
+
+
+async def test_different_errors_are_not_deduplicated():
+  notifier = RecordingNotifier()
+  handler = _handler(notifier, dedup_window=60.0)
+  handler.emit(_record("first"))
+  handler.emit(_record("second"))
+  await _settle()
+  assert len(notifier.messages) == 2
+
+
+async def test_dedup_window_expires():
+  notifier = RecordingNotifier()
+  handler = _handler(notifier, dedup_window=0.0)
+  handler.emit(_record("same"))
+  handler.emit(_record("same"))
+  await _settle()
+  assert len(notifier.messages) == 2
+
+
+async def test_the_notifiers_own_failures_are_not_forwarded():
+  # Otherwise a broken Telegram reports itself over Telegram, forever.
+  notifier = RecordingNotifier()
+  _handler(notifier).emit(
+    _record("Telegram send failed", name="ingester.services.notification_service")
+  )
+  await _settle()
+  assert notifier.messages == []
+
+
+async def test_traceback_is_included():
+  notifier = RecordingNotifier()
+  try:
+    raise ValueError("boom")
+  except ValueError:
+    exc_info = sys.exc_info()
+  _handler(notifier).emit(_record("poll failed", exc=exc_info))
+  await _settle()
+
+  (message,) = notifier.messages
+  assert "ValueError" in message and "boom" in message
+
+
+async def test_unbound_handler_drops_instead_of_raising():
+  notifier = RecordingNotifier()
+  handler = TelegramLogHandler(notifier, instance_id="vps-test")
+  handler.emit(_record("before the loop exists"))
+  await _settle()
+  assert notifier.messages == []

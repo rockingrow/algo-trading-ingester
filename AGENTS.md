@@ -31,12 +31,12 @@ FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
 4. **Pull requests always target `dev`** — never `master`/`main`. Opening the
    PR is the user's call.
 5. **Payload changes are contract changes.** A field added to or changed in
-   `ingestor/schemas/` is a promise to `qte-ingest`: update
+   `ingester/schemas/` is a promise to `qte-ingest`: update
    `examples/nats/`, the README "NATS contract" section and `changelog.md` in
    the same change, and bump `SCHEMA_VERSION` on anything breaking.
 6. **All configuration comes from `.env`.** Symbols, timeframes, gateways,
    host/port, NATS and Telegram settings are never hard-coded; a new setting
-   goes into `ingestor/settings.py` *and* `.env.example` with a comment.
+   goes into `ingester/settings.py` *and* `.env.example` with a comment.
 7. **Never** expose, commit or copy secrets from `.env`, tokens, chat ids, MT5
    logins/passwords or account identifiers. `.env.example` carries
    placeholders only.
@@ -58,7 +58,7 @@ FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
 make install-dev    # uv sync (dev group: ruff, pytest, pytest-asyncio)
 make lint / format  # ruff check . / ruff format .   (make fix = both, with --fix)
 make test           # uv run pytest
-make run            # uv run python -m ingestor   (reads .env)
+make run            # uv run python -m ingester   (reads .env)
 make help           # every target, one line each
 
 uv run pytest -q                            # whole suite (MT5 is faked)
@@ -77,26 +77,26 @@ package; never scan from the repository root.
 1. Table below, to find the owning module.
 2. `sed -n '1,25p' <file>` — modules open with a docstring stating their job
    and their trade-offs.
-3. `rg -n "<symbol>" ingestor tests` — scope the search.
+3. `rg -n "<symbol>" ingester tests` — scope the search.
 4. `tests/test_<topic>.py` — the suite is organised by topic and reads as the
    executable spec for that module.
 
 | Task or concept | Primary location |
 | --- | --- |
-| Canonical wire contract (`Bar`, `BarClosedEvent`, `event_id`, subjects) | `ingestor/schemas/market_event_schema.py` |
-| Shared enums (`Timeframe`, `GatewayEnum`, `MarketEnum`, statuses) | `ingestor/schemas/enums.py` |
-| Ingestion lifecycle, hand-off queue, dispatcher, status + notifications | `ingestor/core/ingestion.py` (`BaseIngestion`, `ThreadedIngestion`) |
-| Gateway registry / factory | `ingestor/core/factory.py`, registration in `ingestor/providers.py` |
-| Interfaces (publisher, notifier, ingestion, DTO) | `ingestor/interfaces/` |
-| MT5 bar-close detection (business logic) | `ingestor/gateways/mt5/ingestion.py` |
-| MT5 rate → canonical `Bar`, server time → UTC | `ingestor/gateways/mt5/dto.py` |
-| MetaTrader5 package adapter | `ingestor/gateways/mt5/terminal.py` |
-| NATS connection and one-way publisher | `ingestor/services/nats_service.py` |
-| Telegram notifier, queue decorator | `ingestor/services/notification_service.py` |
-| Telegram message templates, emoji | `ingestor/helpers/{messages,emoji_constants}.py` |
-| Ordered start/stop of notifier, NATS, gateways | `ingestor/runtime.py` |
-| FastAPI app, `/health`, `/status` | `ingestor/app.py`, `ingestor/api/router.py` |
-| Settings and environment variables | `ingestor/settings.py`, `.env.example` |
+| Canonical wire contract (`Bar`, `BarClosedEvent`, `event_id`, subjects) | `ingester/schemas/market_event_schema.py` |
+| Shared enums (`Timeframe`, `GatewayEnum`, `MarketEnum`, statuses) | `ingester/schemas/enums.py` |
+| Ingestion lifecycle, hand-off queue, dispatcher, status + notifications | `ingester/core/ingestion.py` (`BaseIngestion`, `ThreadedIngestion`) |
+| Gateway registry / factory | `ingester/core/factory.py`, registration in `ingester/providers.py` |
+| Interfaces (publisher, notifier, ingestion, DTO) | `ingester/interfaces/` |
+| MT5 bar-close detection (business logic) | `ingester/gateways/mt5/ingestion.py` |
+| MT5 rate → canonical `Bar`, server time → UTC | `ingester/gateways/mt5/dto.py` |
+| MetaTrader5 package adapter | `ingester/gateways/mt5/terminal.py` |
+| NATS connection and one-way publisher | `ingester/services/nats_service.py` |
+| Telegram notifier, queue decorator | `ingester/services/notification_service.py` |
+| Telegram message templates, emoji | `ingester/helpers/{messages,emoji_constants}.py` |
+| Ordered start/stop of notifier, NATS, gateways | `ingester/runtime.py` |
+| FastAPI app, `/health`, `/status` | `ingester/app.py`, `ingester/api/router.py` |
+| Settings and environment variables | `ingester/settings.py`, `.env.example` |
 | Canonical payload samples | `examples/nats/` |
 | How `qte-ingest` consumes market data | [`quant-trading-engine`](https://github.com/rockingrow/quant-trading-engine) `src/qte_shared/` |
 
@@ -111,7 +111,7 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
 - **One canonical schema, no per-venue branching downstream.** The DTO is the
   only place that knows a venue's payload shape; past `to_bar()` everything
   speaks `Bar` / `BarClosedEvent`.
-- **One way.** The ingestor publishes and never subscribes or requests. Status
+- **One way.** The ingester publishes and never subscribes or requests. Status
   goes to Telegram, not to NATS.
 - **`event_id` is deterministic** (`<gateway>:<symbol>:<tf>:<open epoch>`). It
   is the subscriber's de-duplication key and the JetStream `Nats-Msg-Id`, so it
@@ -153,7 +153,7 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
 
 ## Trading and destructive operations
 
-- Do not point the ingestor at a live NATS cluster or a live MT5 account, or
+- Do not point the ingester at a live NATS cluster or a live MT5 account, or
   change NATS tokens, Telegram tokens or chat ids from a session without an
   explicit request and confirmation of the target environment.
 - A published bar is not recallable: strategies downstream may trade on it.

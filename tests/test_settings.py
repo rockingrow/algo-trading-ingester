@@ -1,5 +1,5 @@
-from ingestor.schemas import GatewayEnum, MarketEnum, Timeframe
-from ingestor.settings import AppSettings, Mt5Settings, NatsSettings
+from ingester.schemas import GatewayEnum, MarketEnum, Timeframe
+from ingester.settings import AppSettings, Mt5Settings, NatsSettings
 
 
 def test_csv_env_vars_are_parsed(monkeypatch):

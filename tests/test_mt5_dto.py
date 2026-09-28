@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
-from ingestor.gateways.mt5.dto import Mt5RateDTO, server_time_to_utc
-from ingestor.schemas import Timeframe
+from ingester.gateways.mt5.dto import Mt5RateDTO, server_time_to_utc
+from ingester.schemas import Timeframe
 from tests.fakes import rate
 
 # 2026-07-01 12:00 written on the server's wall clock, stored "as if UTC".

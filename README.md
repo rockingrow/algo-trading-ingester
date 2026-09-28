@@ -1,4 +1,4 @@
-# Algo Trading Ingestor
+# Algo Trading Ingester
 
 A market-data gateway for the algo-trading ecosystem. It watches upstream venues
 for **closed bars**, normalises them into **one canonical schema**, and
@@ -25,8 +25,8 @@ publishes them **one way** to NATS for
 ### 2. Install
 
 ```bash
-git clone https://github.com/rockingrow/algo-trading-ingestor
-cd algo-trading-ingestor
+git clone https://github.com/rockingrow/algo-trading-ingester
+cd algo-trading-ingester
 
 cp .env.example .env   # symbols, timeframes, NATS, Telegram, MT5 …
 uv sync                # or: make install-dev
@@ -37,7 +37,7 @@ The `MetaTrader5` package is only installed on Windows (it has no other wheels).
 ### 3. Run
 
 ```bash
-uv run python -m ingestor   # or: make run
+uv run python -m ingester   # or: make run
 ```
 
 - `GET /health` — liveness + NATS connection state
@@ -60,7 +60,7 @@ flowchart LR
         MT5[("MT5 terminal")]
     end
 
-    subgraph ing["algo-trading-ingestor (this repo)"]
+    subgraph ing["algo-trading-ingester (this repo)"]
         direction LR
         T["mt5-ingestion thread<br/>connect → poll → reconnect"]
         DTO["Mt5RateDTO<br/>→ canonical Bar"]
@@ -103,8 +103,16 @@ newest **completed** bars (`copy_rates_from_pos(symbol, tf, 1, MT5_CATCHUP_BARS)
 — position 0 is the bar still forming) and emits every bar newer than the last
 one it emitted.
 
+- **Symbols** are named bare in `.env` (`XAUUSD`). The gateway asks the
+  terminal what this broker calls the instrument — Exness sells it as
+  `XAUUSDm` — and reads bars from that name, while the published `symbol`
+  stays the configured one, so `event_id` survives a change of broker. A fully
+  spelled `XAUUSDm` is used verbatim; `MT5_SYMBOL_SUFFIX` settles a tie
+  between, say, `EURUSDm` and `EURUSDc`.
 - **Start-up** only records the latest closed bar, so a restart does not
-  re-publish history.
+  re-publish history. With `MT5_BACKFILL_ON_START=true` it publishes that whole
+  window instead, recovering the bars a crash would otherwise skip — pair it
+  with JetStream, which drops the replayed duplicates by `event_id`.
 - **Catch-up**: bars that closed during a terminal disconnect are published,
   oldest first, after reconnecting (up to `MT5_CATCHUP_BARS`).
 - **Server time**: MT5 stamps bars in trade-server time. Set
@@ -127,16 +135,16 @@ INGEST.bar.closed.mt5.*.H1       # every MT5 symbol, H1 only
 Characters NATS reserves are replaced with `_` in the subject token only
 (`XAUUSD.m` → `XAUUSD_m`); the payload keeps the symbol verbatim.
 
-**Payload** — `BarClosedEvent` (`ingestor/schemas/market_event_schema.py`), JSON,
+**Payload** — `BarClosedEvent` (`ingester/schemas/market_event_schema.py`), JSON,
 all times UTC. Full example:
 [`examples/nats/bar.closed.mt5.json`](examples/nats/bar.closed.mt5.json).
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | `1.0` — bumped on breaking changes |
+| `schema_version` | `2.0` — bumped on breaking changes |
 | `event_id` | `<gateway>:<symbol>:<tf>:<open epoch>` — deterministic; de-dup key and JetStream `Nats-Msg-Id` |
 | `event_type` | `bar.closed` |
-| `source` | `gateway`, `market`, `ingestor_id`, `venue` (e.g. MT5 server) |
+| `source` | `gateway`, `market`, `ingester_id`, `venue` (e.g. MT5 server) |
 | `symbol`, `timeframe` | as configured; timeframe ∈ `M1 M5 M15 M30 H1 H4 D1 W1` |
 | `bar` | `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume`, `tick_count`, `quote_volume`, `spread` |
 
@@ -153,13 +161,30 @@ them (MT5 has no `quote_volume`, Binance has no `spread`).
 
 With `TELEGRAM_ENABLED=true`, the bot posts to every chat in `TELEGRAM_CHAT_IDS`:
 
-- ingestor **running** (endpoint, NATS subject, symbols × timeframes) /
-  **stopped** / **failed to start**
+- ingester **running** (endpoint, NATS subject, symbols × timeframes) /
+  **stopped** / **degraded** (started, but NATS or a gateway is down)
 - each gateway's status changes: `starting`, `running`, `disconnected` (with the
   reason), `stopped`
 - NATS **disconnected** / **reconnected**
 
 Messages go through a bounded queue, so a slow Telegram never delays a bar.
+
+### Errors in their own chat
+
+`TELEGRAM_LOG_ERRORS_ENABLED=true` mirrors every `ERROR` log record into
+`TELEGRAM_LOG_CHAT_IDS` (falling back to `TELEGRAM_CHAT_IDS`), with its own
+optional bot token and its own queue, so a burst of failures cannot delay a
+lifecycle message. Identical records inside `TELEGRAM_LOG_DEDUP_WINDOW` seconds
+are dropped — a failing poll repeats every interval. Only `ingester.*` records
+are forwarded; uvicorn keeps its own loggers.
+
+### Staying up
+
+The ingester does not exit because a dependency is down. If NATS is unreachable
+at start-up, or a gateway refuses to start, it logs the error, posts an
+**Ingester Degraded** message and keeps running: NATS reconnects underneath,
+and a supervisor restart would only drop more bars. One malformed record on one
+symbol is logged and skipped without starving the other symbols of that poll.
 
 ---
 
@@ -177,7 +202,10 @@ key with comments. The main ones:
 | `NATS_SUBJECT_PREFIX` | `INGEST` |
 | `NATS_JETSTREAM_ENABLED` | `false` |
 | `TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` | `true`, `…`, `-100…,-100…_42` |
-| `MT5_SYMBOLS` | `XAUUSD,EURUSD` |
+| `TELEGRAM_LOG_ERRORS_ENABLED`, `TELEGRAM_LOG_CHAT_IDS` | `true`, `-100…_13` |
+| `MT5_SYMBOLS` | `XAUUSD,EURUSD` (bare names; the affix is detected) |
+| `MT5_SYMBOL_SUFFIX` | blank = detect; `m` to force Exness naming |
+| `MT5_BACKFILL_ON_START` | `false` |
 | `MT5_TIMEFRAMES` | `M1,M15,H1` |
 | `MT5_SERVER_TIMEZONE` | `Europe/Athens` |
 | `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_TERMINAL_PATH` | blank = use the logged-in terminal |
@@ -214,8 +242,8 @@ status endpoint come for free.
 ## 📁 Project structure
 
 ```text
-algo-trading-ingestor/
-├── ingestor/
+algo-trading-ingester/
+├── ingester/
 │   ├── api/             # FastAPI routes: /health, /status
 │   ├── core/            # BaseIngestion, ThreadedIngestion, IngestionFactory, errors
 │   ├── gateways/

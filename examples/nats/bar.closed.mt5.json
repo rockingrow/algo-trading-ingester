@@ -1,11 +1,11 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "event_id": "mt5:XAUUSD:M15:1790589600",
   "event_type": "bar.closed",
   "source": {
     "gateway": "mt5",
     "market": "forex",
-    "ingestor_id": "vps-mt5-01",
+    "ingester_id": "vps-mt5-01",
     "venue": "Broker-Server-Demo"
   },
   "emitted_at": "2026-09-28T10:15:00.412000Z",

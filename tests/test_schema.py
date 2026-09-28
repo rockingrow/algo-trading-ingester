@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from ingestor.schemas import (
+from ingester.schemas import (
   SCHEMA_VERSION,
   Bar,
   BarClosedEvent,
@@ -31,7 +31,7 @@ def make_bar(**overrides) -> Bar:
 
 
 SOURCE = EventSource(
-  gateway=GatewayEnum.MT5, market=MarketEnum.FOREX, ingestor_id="vps-1"
+  gateway=GatewayEnum.MT5, market=MarketEnum.FOREX, ingester_id="vps-1"
 )
 
 

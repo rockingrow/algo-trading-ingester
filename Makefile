@@ -10,7 +10,7 @@ help:
 	@echo "  make format        - ruff format"
 	@echo "  make lint          - ruff check"
 	@echo "  make test          - Run the pytest suite"
-	@echo "  make run           - Run the ingestor (reads .env)"
+	@echo "  make run           - Run the ingester (reads .env)"
 
 install:
 	uv sync --no-dev
@@ -40,5 +40,5 @@ check: lint
 test:
 	uv run pytest
 
-run:
-	uv run python -m ingestor
+start:
+	uv run python -m ingester

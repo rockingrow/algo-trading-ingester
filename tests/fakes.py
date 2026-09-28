@@ -1,13 +1,14 @@
-"""Test doubles for the ingestor's interfaces."""
+"""Test doubles for the ingester's interfaces."""
 
 from __future__ import annotations
 
 import asyncio
 import threading
+from fnmatch import fnmatchcase
 from typing import Any
 
-from ingestor.schemas.enums import Timeframe
-from ingestor.schemas.market_event_schema import MarketEvent
+from ingester.schemas.enums import Timeframe
+from ingester.schemas.market_event_schema import MarketEvent
 
 
 class FakePublisher:
@@ -71,6 +72,10 @@ class FakeTerminal:
   def __init__(self) -> None:
     self._lock = threading.Lock()
     self.rates: dict[tuple[str, Timeframe], list[dict[str, Any]]] = {}
+    #: Broker catalogue for symbol resolution. ``None`` = derive it from the
+    #: scripted rates, so a test that does not care about affixes sees the
+    #: symbol it configured.
+    self.catalogue: list[str] | None = None
     self.connected = True
     self.initialize_ok = True
     self.initialize_calls = 0
@@ -95,6 +100,15 @@ class FakeTerminal:
 
   def server_name(self) -> str | None:
     return "Fake-Server"
+
+  def symbol_names(self, pattern: str) -> list[str]:
+    with self._lock:
+      names = (
+        list(self.catalogue)
+        if self.catalogue is not None
+        else sorted({symbol for symbol, _ in self.rates})
+      )
+    return [name for name in names if fnmatchcase(name, pattern)]
 
   def symbol_select(self, symbol: str, enable: bool = True) -> bool:
     return True

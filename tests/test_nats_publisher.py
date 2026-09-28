@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from ingestor.schemas import (
+from ingester.schemas import (
   Bar,
   BarClosedEvent,
   EventSource,
@@ -9,8 +9,8 @@ from ingestor.schemas import (
   MarketEnum,
   Timeframe,
 )
-from ingestor.services.nats_service import NatsPublisher
-from ingestor.settings import NatsSettings
+from ingester.services.nats_service import NatsPublisher
+from ingester.settings import NatsSettings
 
 OPEN = datetime(2026, 9, 28, 10, 0, tzinfo=UTC)
 
@@ -33,7 +33,7 @@ def make_event(symbol="XAUUSD.m") -> BarClosedEvent:
     close=1.5,
   )
   source = EventSource(
-    gateway=GatewayEnum.MT5, market=MarketEnum.FOREX, ingestor_id="x"
+    gateway=GatewayEnum.MT5, market=MarketEnum.FOREX, ingester_id="x"
   )
   return BarClosedEvent.create(
     source=source, symbol=symbol, timeframe=Timeframe.M15, bar=bar
