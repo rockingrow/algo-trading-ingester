@@ -20,7 +20,21 @@ def main() -> None:
   )
   log.info("HTTP     → http://%s:%d", settings.app.HOST, settings.app.PORT)
   log.info("NATS     → %s (prefix %s)", settings.nats.url, settings.nats.SUBJECT_PREFIX)
-  log.info("Gateways → %s", ", ".join(g.value for g in settings.app.GATEWAYS))
+  log.info(
+    "Markets  → %s (from %s)",
+    ", ".join(m.value for m in settings.source.MARKET),
+    settings.source.CONFIG_DIR,
+  )
+  log.info(
+    "Gateways → %s",
+    ", ".join(
+      f"{market.value}/{gateway.value}"
+      for market, gateway, _ in settings.gateway_configs
+    )
+    or "none enabled",
+  )
+  for problem in settings.market_problems:
+    log.error("Market configuration: %s", problem)
 
   uvicorn.run(
     create_app(),

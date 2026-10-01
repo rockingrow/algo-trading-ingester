@@ -8,6 +8,7 @@ and the only place a new gateway has to be registered.
 from __future__ import annotations
 
 from ingester.core.factory import IngestionFactory
+from ingester.gateways.binance import build_binance_ingestion
 from ingester.gateways.mt5 import build_mt5_ingestion
 from ingester.runtime import IngesterRuntime
 from ingester.schemas.enums import GatewayEnum
@@ -22,9 +23,10 @@ from ingester.settings import Settings, TelegramSettings
 
 
 def make_ingestion_factory() -> IngestionFactory:
-  """Every gateway the ingester can run. Binance: register it here."""
+  """Every gateway the ingester can run. A new venue: register it here."""
   factory = IngestionFactory()
   factory.register(GatewayEnum.MT5, build_mt5_ingestion)
+  factory.register(GatewayEnum.BINANCE, build_binance_ingestion)
   return factory
 
 

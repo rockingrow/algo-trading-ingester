@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────
+# Crypto market — copy to config/crypto.toml and edit.
+#
+# Loaded when SOURCE_MARKET in .env lists "crypto". Every table below is one
+# gateway; "enable" decides whether this market starts it. The market itself is
+# not written here — it is the name of this file, and a table that sets "market"
+# is refused at start-up rather than quietly accepted.
+# ─────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+# Binance kline websocket (runs on any OS, needs no API key: the
+# market-data streams are public)
+# ─────────────────────────────────────────────────────────────────
+[binance]
+enable = true
+
+# Binance spells its pairs without a separator and in upper case. The name
+# written here is the one published, and therefore the one in event_id.
+symbols = ["BTCUSDT", "ETHUSDT"]
+
+# Any of: M1, M5, M15, M30, H1, H4, D1, W1 — mapped onto Binance's own
+# interval spelling (M15 → 15m) by the gateway.
+timeframes = ["M1", "M15", "H1"]
+
+# Combined-stream endpoint. Spot mainnet by default:
+#   wss://testnet.binance.vision/stream   — testnet
+#   wss://fstream.binance.com/stream      — USD-M futures
+ws_url = "wss://stream.binance.com:9443/stream"
+
+# Seconds before a dropped socket is dialled again
+reconnect_interval_seconds = 5.0
+
+# Websocket keep-alive. Binance answers pings; a peer that stops answering is
+# dropped after ping_timeout_seconds so the reconnect loop can take over.
+ping_interval_seconds = 20.0
+ping_timeout_seconds = 20.0
+
+# Seconds without any message before the connection counts as dead. Binance
+# pushes kline updates continuously, so silence means the socket is a husk.
+# Keep it well above the slowest expected update, or a healthy stream is cut.
+idle_timeout_seconds = 90.0

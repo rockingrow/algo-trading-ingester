@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────
+# Forex market — copy to config/forex.toml and edit.
+#
+# Loaded when SOURCE_MARKET in .env lists "forex". Every table below is one
+# gateway; "enable" decides whether this market starts it. The market itself is
+# not written here — it is the name of this file.
+#
+# Secrets stay in .env, never in this file: MT5_LOGIN, MT5_PASSWORD, MT5_SERVER,
+# MT5_TERMINAL_PATH and MT5_TIMEOUT_MS are read from there — writing login,
+# password, server, terminal_path, timeout_ms or market here is refused at
+# start-up rather than quietly accepted.
+#
+# One gateway runs in one market: [mt5] enabled here and in another market file
+# is refused in the second, because MetaTrader 5 keeps a single process-wide
+# terminal session.
+# ─────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+# MetaTrader 5 gateway (Windows only — needs a running MT5 terminal)
+# ─────────────────────────────────────────────────────────────────
+[mt5]
+enable = true
+
+# Name the bare instrument. The gateway asks the terminal what this broker
+# calls it (Exness sells XAUUSD as XAUUSDm) and reads bars from that name, but
+# publishes the name written here — so event_id survives a change of broker.
+# A fully-spelled name (XAUUSDm) is still used verbatim.
+symbols = ["XAUUSD", "EURUSD"]
+
+# Forces the broker's affix when auto-detection finds several equally close
+# candidates, e.g. EURUSDm vs EURUSDc. Blank = detect it per symbol.
+symbol_suffix = ""
+
+# Any of: M1, M5, M15, M30, H1, H4, D1, W1
+timeframes = ["M1", "M15", "H1"]
+
+# MT5 bar times are in trade-server time. Set the server's IANA zone so they are
+# converted to UTC correctly — most brokers on GMT+2/GMT+3 (DST) match
+# Europe/Athens or Asia/Nicosia. Check: the server time in Market Watch vs UTC.
+server_timezone = "UTC"
+
+# Seconds between checks for a newly closed bar
+poll_interval_seconds = 1.0
+
+# Closed bars read per check — how many missed bars a reconnect can recover.
+# The recovery window is this × the timeframe: 16 bars of M15 = 4 hours.
+catchup_bars = 5
+
+# false = a restart silently skips every bar that closed while it was down.
+# true = those bars are published at start-up, bounded by catchup_bars.
+# Turn NATS_JETSTREAM_ENABLED on with it: bars the previous process already
+# sent are republished, and JetStream drops them by event_id.
+backfill_on_start = false
+
+reconnect_interval_seconds = 5.0

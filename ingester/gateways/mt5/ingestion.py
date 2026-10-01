@@ -7,18 +7,18 @@ newest *completed* bars — position 1 onwards, since position 0 is the bar stil
 forming — and emits every bar whose open time is later than the last one it
 emitted.
 
-* **Symbols**: ``.env`` names the bare instrument (``XAUUSD``) and
-  :mod:`~ingester.gateways.mt5.symbols` maps it onto whatever this broker calls
-  it (Exness: ``XAUUSDm``). Only the MetaTrader5 calls use the broker's name —
-  the published ``symbol`` stays the configured one.
+* **Symbols**: the market file's ``[mt5]`` table names the bare instrument
+  (``XAUUSD``) and :mod:`~ingester.gateways.mt5.symbols` maps it onto whatever
+  this broker calls it (Exness: ``XAUUSDm``). Only the MetaTrader5 calls use the
+  broker's name — the published ``symbol`` stays the configured one.
 * **Start-up**: the first read only records the latest closed bar; nothing is
   emitted, so a restart never re-publishes history. With
-  ``MT5_BACKFILL_ON_START`` it publishes that whole window instead, recovering
+  ``backfill_on_start`` it publishes that whole window instead, recovering
   the bars a crash skipped.
-* **Catch-up**: each read fetches ``MT5_CATCHUP_BARS`` bars, so bars that closed
+* **Catch-up**: each read fetches ``catchup_bars`` bars, so bars that closed
   while the terminal was disconnected are still published, oldest first.
 * **Timing**: MT5 opens a new bar on its first tick, so a close is seen on the
-  first tick of the next bar plus up to one ``MT5_POLL_INTERVAL_SECONDS``.
+  first tick of the next bar plus up to one ``poll_interval_seconds``.
 
 Everything else — the thread, reconnects, publishing, notifications — is the
 core's job (:class:`~ingester.core.ingestion.ThreadedIngestion`).
