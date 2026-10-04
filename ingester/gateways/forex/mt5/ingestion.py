@@ -1,5 +1,5 @@
 """
-ingester/gateways/mt5/ingestion.py — MT5 bar-close detection (business logic only).
+ingester/gateways/forex/mt5/ingestion.py — MT5 bar-close detection (business logic).
 
 The MetaTrader5 package has no event callbacks, so a "bar closed" event is
 derived by polling. For every (symbol, timeframe) the watcher thread reads the
@@ -7,18 +7,18 @@ newest *completed* bars — position 1 onwards, since position 0 is the bar stil
 forming — and emits every bar whose open time is later than the last one it
 emitted.
 
-* **Symbols**: ``.env`` names the bare instrument (``XAUUSD``) and
-  :mod:`~ingester.gateways.mt5.symbols` maps it onto whatever this broker calls
-  it (Exness: ``XAUUSDm``). Only the MetaTrader5 calls use the broker's name —
-  the published ``symbol`` stays the configured one.
+* **Symbols**: the market file's ``[mt5]`` table names the bare instrument
+  (``XAUUSD``) and :mod:`~ingester.gateways.forex.mt5.symbols` maps it onto whatever
+  this broker calls it (Exness: ``XAUUSDm``). Only the MetaTrader5 calls use the
+  broker's name — the published ``symbol`` stays the configured one.
 * **Start-up**: the first read only records the latest closed bar; nothing is
   emitted, so a restart never re-publishes history. With
-  ``MT5_BACKFILL_ON_START`` it publishes that whole window instead, recovering
+  ``backfill_on_start`` it publishes that whole window instead, recovering
   the bars a crash skipped.
-* **Catch-up**: each read fetches ``MT5_CATCHUP_BARS`` bars, so bars that closed
+* **Catch-up**: each read fetches ``catchup_bars`` bars, so bars that closed
   while the terminal was disconnected are still published, oldest first.
 * **Timing**: MT5 opens a new bar on its first tick, so a close is seen on the
-  first tick of the next bar plus up to one ``MT5_POLL_INTERVAL_SECONDS``.
+  first tick of the next bar plus up to one ``poll_interval_seconds``.
 
 Everything else — the thread, reconnects, publishing, notifications — is the
 core's job (:class:`~ingester.core.ingestion.ThreadedIngestion`).
@@ -30,17 +30,15 @@ import logging
 from typing import Any, ClassVar
 
 from ingester.core.errors import GatewayConnectionError, SymbolResolutionError
-from ingester.core.ingestion import ThreadedIngestion
-from ingester.gateways.mt5.dto import Mt5RateDTO
-from ingester.gateways.mt5.symbols import resolve_symbol
-from ingester.gateways.mt5.terminal import Mt5Terminal
+from ingester.core.ingestion import StreamKey, ThreadedIngestion
+from ingester.gateways.forex.mt5.dto import Mt5RateDTO
+from ingester.gateways.forex.mt5.symbols import resolve_symbol
+from ingester.gateways.forex.mt5.terminal import Mt5Terminal
 from ingester.logger import get_logger
 from ingester.schemas.enums import GatewayEnum, Timeframe
 from ingester.settings import Mt5Settings
 
 log = get_logger(__name__)
-
-StreamKey = tuple[str, Timeframe]
 
 
 class Mt5Ingestion(ThreadedIngestion):
@@ -57,9 +55,9 @@ class Mt5Ingestion(ThreadedIngestion):
     )
     self._mt5_config = config
     self._terminal = terminal
-    # Server-clock epoch of the newest bar already emitted, per stream. Kept
-    # across reconnects so the catch-up read knows where it left off.
-    self._last_open: dict[StreamKey, int] = {}
+    # The newest bar already emitted per stream is remembered by the core, as a
+    # server-clock epoch; it survives reconnects, so the catch-up read knows
+    # where it left off.
     # Streams currently returning no data — warned about once, not every poll.
     self._silent: set[StreamKey] = set()
     # Configured symbol → the name this broker actually sells it under.
@@ -178,10 +176,9 @@ class Mt5Ingestion(ThreadedIngestion):
       key=lambda rate: rate.time,
     )
 
-    last = self._last_open.get(key)
-    if last is None:
+    if self._open_mark(symbol, timeframe) is None:
       if not self._mt5_config.BACKFILL_ON_START:
-        self._last_open[key] = rates[-1].time
+        self._remember_bar(symbol, timeframe, rates[-1].time)
         log.info(
           "MT5 %s %s primed at bar %s",
           symbol,
@@ -189,11 +186,11 @@ class Mt5Ingestion(ThreadedIngestion):
           rates[-1].to_bar(timeframe).open_time.isoformat(),
         )
         return
-      # Treat the whole window as unpublished, so the bars that closed while
-      # this process was down are recovered. A bar the previous process already
-      # sent is republished — harmless, because ``event_id`` is deterministic
-      # and JetStream drops it as a duplicate.
-      last = rates[0].time - 1
+      # Nothing is remembered yet, so the whole window counts as unpublished
+      # and the bars that closed while this process was down are recovered. A
+      # bar the previous process already sent is republished — harmless,
+      # because ``event_id`` is deterministic and JetStream drops it as a
+      # duplicate.
       log.info(
         "MT5 %s %s backfilling %d closed bar(s) from %s",
         symbol,
@@ -203,7 +200,7 @@ class Mt5Ingestion(ThreadedIngestion):
       )
 
     for rate in rates:
-      if rate.time > last:
+      if self._is_new_bar(symbol, timeframe, rate.time):
         bar = rate.to_bar(timeframe)
         if log.isEnabledFor(logging.DEBUG):
           # Guarded: model_dump_json() would otherwise run on every bar even
@@ -215,5 +212,4 @@ class Mt5Ingestion(ThreadedIngestion):
             bar.model_dump_json(),
           )
         self.emit_bar(symbol, timeframe, bar)
-        last = rate.time
-    self._last_open[key] = last
+        self._remember_bar(symbol, timeframe, rate.time)

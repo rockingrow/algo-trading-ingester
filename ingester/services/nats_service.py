@@ -10,9 +10,10 @@ Two delivery modes, chosen by ``NATS_JETSTREAM_ENABLED``:
 
 * **Core NATS** (default) — fire-and-forget. While reconnecting, nats-py buffers
   writes and flushes them once the link is back.
-* **JetStream** — each event is persisted on stream ``NATS_STREAM_NAME`` so a
-  subscriber that was down can replay it. ``event_id`` rides as
-  ``Nats-Msg-Id``, so a re-publish of the same bar is dropped by the stream.
+* **JetStream** — each event is persisted on a stream named after
+  ``NATS_SUBJECT_PREFIX`` so a subscriber that was down can replay it.
+  ``event_id`` rides as ``Nats-Msg-Id``, so a re-publish of the same bar is
+  dropped by the stream.
 """
 
 from __future__ import annotations
@@ -118,7 +119,7 @@ class NatsConnection:
 
   async def _ensure_stream(self) -> None:
     """Create the stream if absent; never reconfigure one that exists."""
-    name = self._config.STREAM_NAME
+    name = self._config.stream_name
     subjects = [f"{self._config.SUBJECT_PREFIX}.>"]
     try:
       info = await self.js.stream_info(name)
@@ -157,8 +158,9 @@ class NatsConnection:
       log.error(
         "JetStream stream %s listens on %s but this ingester publishes to %s — "
         "publishes will be rejected unless an existing subject covers it. "
-        "Check NATS_STREAM_NAME against NATS_SUBJECT_PREFIX.",
-        self._config.STREAM_NAME,
+        "The stream pre-dates this NATS_SUBJECT_PREFIX; recreate it or publish "
+        "under the prefix it already carries.",
+        self._config.stream_name,
         subjects or "nothing",
         wanted_subject,
       )
@@ -170,7 +172,7 @@ class NatsConnection:
         "JetStream stream %s de-duplicates over %.0fs, less than the "
         "configured %.0fs; a restart that backfills further back than that "
         "will republish bars. Recreate the stream to widen the window.",
-        self._config.STREAM_NAME,
+        self._config.stream_name,
         window,
         wanted_window,
       )

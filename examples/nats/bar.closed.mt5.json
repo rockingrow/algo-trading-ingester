@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.0",
+  "schema_version": "1.0",
   "event_id": "mt5:XAUUSD:M15:1790589600",
   "event_type": "bar.closed",
   "source": {

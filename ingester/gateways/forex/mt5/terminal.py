@@ -1,5 +1,5 @@
 """
-ingester/gateways/mt5/terminal.py — The seam between our code and MetaTrader5.
+ingester/gateways/forex/mt5/terminal.py — The seam between our code and MetaTrader5.
 
 :class:`Mt5Terminal` is the small slice of the MetaTrader5 package the gateway
 uses. :class:`MetaTrader5Terminal` implements it over the real package, which

@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from ingester.gateways.mt5.dto import Mt5RateDTO, server_time_to_utc
+from ingester.gateways.forex.mt5.dto import Mt5RateDTO, server_time_to_utc
 from ingester.schemas import Timeframe
 from tests.fakes import rate
 

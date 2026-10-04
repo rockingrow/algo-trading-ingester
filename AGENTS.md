@@ -9,10 +9,12 @@ Follow a more specific `AGENTS.md` in a subdirectory when one exists.
 
 ## The project in five lines
 
-Market-data gateway. Each gateway (MetaTrader 5 today, Binance websocket next)
-detects **closed bars**, turns the venue payload into the canonical
-`BarClosedEvent` through its DTO, and publishes it **one way** to NATS on
-`<NATS_SUBJECT_PREFIX>.bar.closed.<gateway>.<symbol>.<timeframe>`, where
+Market-data gateway. One process runs several **markets** side by side
+(`SOURCE_MARKET=forex,crypto`), each market's gateways read from
+`config/<market>.toml`. Every gateway (MetaTrader 5 for forex, the Binance
+websocket for crypto) detects **closed bars**, turns the venue payload into the
+canonical `BarClosedEvent` through its DTO, and publishes it **one way** to NATS
+on `<NATS_SUBJECT_PREFIX>.bar.closed.<gateway>.<symbol>.<timeframe>`, where
 [Quant-Trading-Engine](https://github.com/rockingrow/quant-trading-engine)'s
 `qte-ingest` consumes it. Service status goes to Telegram. Python 3.13, uv,
 FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
@@ -34,9 +36,15 @@ FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
    `ingester/schemas/` is a promise to `qte-ingest`: update
    `examples/nats/`, the README "NATS contract" section and `changelog.md` in
    the same change, and bump `SCHEMA_VERSION` on anything breaking.
-6. **All configuration comes from `.env`.** Symbols, timeframes, gateways,
-   host/port, NATS and Telegram settings are never hard-coded; a new setting
-   goes into `ingester/settings.py` *and* `.env.example` with a comment.
+6. **Configuration is never hard-coded, and it lives in one of two places.**
+   `.env` holds what belongs to *this process and host*: app, logging, NATS,
+   Telegram, `SOURCE_MARKET`, and venue credentials (`MT5_LOGIN` …).
+   `config/<market>.toml` holds what to *ingest*, one `[gateway]` table per
+   venue with `enable` first. A new setting goes into `ingester/settings.py`
+   *and* the matching template — `.env.example` or
+   `config/<market>.example.toml` — with a comment. The operator's own
+   `config/*.toml` is git-ignored; only the `*.example.toml` templates are
+   committed.
 7. **Never** expose, commit or copy secrets from `.env`, tokens, chat ids, MT5
    logins/passwords or account identifiers. `.env.example` carries
    placeholders only.
@@ -55,19 +63,27 @@ FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
 ## Commands
 
 ```bash
+cp .env.example .env                              # process settings, secrets
+cp config/forex.example.toml config/forex.toml    # what the forex market ingests
+cp config/crypto.example.toml config/crypto.toml  # … and the crypto market
+# or: make forex / make crypto — the same copy, never over an existing file
+
 make install-dev    # uv sync (dev group: ruff, pytest, pytest-asyncio)
 make lint / format  # ruff check . / ruff format .   (make fix = both, with --fix)
 make test           # uv run pytest
 make run            # uv run python -m ingester   (reads .env)
 make help           # every target, one line each
 
-uv run pytest -q                            # whole suite (MT5 is faked)
+uv run pytest -q                            # whole suite (both venues are faked)
 uv run pytest tests/test_mt5_ingestion.py -q # one file while iterating
 ```
 
 The MT5 gateway only starts on Windows with a running terminal; on any other OS
-the app stops at start-up with a clear `MetaTrader5 package is not installed`
-error, which is expected.
+it reports `MetaTrader5 package is not installed`, which is expected — the
+process stays up and the other markets keep ingesting. The Binance gateway runs
+on any OS and needs no API key (the kline streams are public), but it does dial
+a live venue: point `ws_url` at `wss://testnet.binance.vision/stream`, or leave
+`enable = false`, rather than opening a socket to production from a session.
 
 ## Repository navigation
 
@@ -85,18 +101,25 @@ package; never scan from the repository root.
 | --- | --- |
 | Canonical wire contract (`Bar`, `BarClosedEvent`, `event_id`, subjects) | `ingester/schemas/market_event_schema.py` |
 | Shared enums (`Timeframe`, `GatewayEnum`, `MarketEnum`, statuses) | `ingester/schemas/enums.py` |
-| Ingestion lifecycle, hand-off queue, dispatcher, status + notifications | `ingester/core/ingestion.py` (`BaseIngestion`, `ThreadedIngestion`) |
+| Ingestion lifecycle, hand-off queue, dispatcher, status + notifications | `ingester/core/ingestion.py` (`BaseIngestion`, `ThreadedIngestion`, `AsyncStreamIngestion`) |
+| Per-stream de-duplication shared by every gateway | `BaseIngestion._is_new_bar` / `_remember_bar` in `ingester/core/ingestion.py` |
+| Base class of every gateway DTO | `ingester/core/dto.py` (`BaseBarDTO`) |
 | Gateway registry / factory | `ingester/core/factory.py`, registration in `ingester/providers.py` |
+| Which markets and gateways run | `SOURCE_MARKET` in `.env` → `config/<market>.toml`, loaded by `settings.load_market` |
 | Interfaces (publisher, notifier, ingestion, DTO) | `ingester/interfaces/` |
-| MT5 bar-close detection (business logic) | `ingester/gateways/mt5/ingestion.py` |
-| MT5 rate → canonical `Bar`, server time → UTC | `ingester/gateways/mt5/dto.py` |
-| MetaTrader5 package adapter | `ingester/gateways/mt5/terminal.py` |
+| MT5 bar-close detection (business logic) | `ingester/gateways/forex/mt5/ingestion.py` |
+| Binance bar-close detection (business logic) | `ingester/gateways/crypto/binance/ingestion.py` |
+| Binance kline → canonical `Bar`, interval mapping | `ingester/gateways/crypto/binance/dto.py` |
+| Binance websocket adapter | `ingester/gateways/crypto/binance/stream.py` |
+| Binance REST klines adapter (`backfill_on_start`) | `ingester/gateways/crypto/binance/history.py` |
+| MT5 rate → canonical `Bar`, server time → UTC | `ingester/gateways/forex/mt5/dto.py` |
+| MetaTrader5 package adapter | `ingester/gateways/forex/mt5/terminal.py` |
 | NATS connection and one-way publisher | `ingester/services/nats_service.py` |
 | Telegram notifier, queue decorator | `ingester/services/notification_service.py` |
 | Telegram message templates, emoji | `ingester/helpers/{messages,emoji_constants}.py` |
 | Ordered start/stop of notifier, NATS, gateways | `ingester/runtime.py` |
 | FastAPI app, `/health`, `/status` | `ingester/app.py`, `ingester/api/router.py` |
-| Settings and environment variables | `ingester/settings.py`, `.env.example` |
+| Settings, environment variables, market files | `ingester/settings.py`, `.env.example`, `config/*.example.toml` |
 | Canonical payload samples | `examples/nats/` |
 | How `qte-ingest` consumes market data | [`quant-trading-engine`](https://github.com/rockingrow/quant-trading-engine) `src/qte_shared/` |
 
@@ -106,19 +129,33 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
 
 - **Gateways own business logic only.** A gateway never imports NATS or
   Telegram; the core never imports a venue SDK. A new venue is a
-  `GatewaySettings` subclass, a DTO, an ingestion class and one `register` line
-  in `providers.py` — nothing else changes.
+  `GatewaySettings` subclass, a DTO (`BaseBarDTO`), an ingestion class
+  (`ThreadedIngestion` for a blocking SDK, `AsyncStreamIngestion` for an
+  asyncio feed) and one `register` line in `providers.py` — nothing else
+  changes.
+- **Venues are grouped by market on disk**: `ingester/gateways/<market>/<venue>/`
+  (`forex/mt5`, `crypto/binance`). A new venue goes under the market it
+  natively serves; a new market is a new folder. The folder is a grouping only
+  and never decides the market a running gateway reports.
 - **One canonical schema, no per-venue branching downstream.** The DTO is the
   only place that knows a venue's payload shape; past `to_bar()` everything
   speaks `Bar` / `BarClosedEvent`.
+- **Markets are independent.** Each gateway owns its own source (the MT5
+  gateway a dedicated thread, the Binance gateway an asyncio task) and its own
+  publish queue, so a venue that drops never touches another market's bars. A
+  market whose file will not load is reported as **Ingester Degraded**; the
+  markets that did load still run.
+- **A gateway's market comes from the file it is configured in.** `[mt5]` in
+  `config/forex.toml` is forex. The table never repeats it, so it can never
+  contradict it.
 - **One way.** The ingester publishes and never subscribes or requests. Status
   goes to Telegram, not to NATS.
 - **`event_id` is deterministic** (`<gateway>:<symbol>:<tf>:<open epoch>`). It
   is the subscriber's de-duplication key and the JetStream `Nats-Msg-Id`, so it
   must never include `emitted_at` or anything random.
 - **Everything is UTC.** MT5 bar times are trade-server time and are converted
-  in the DTO through `MT5_SERVER_TIMEZONE`; naive datetimes are rejected by the
-  schema.
+  in the DTO through the `[mt5]` table's `server_timezone`; Binance stamps
+  milliseconds in UTC already; naive datetimes are rejected by the schema.
 - **Thread boundary.** Every MetaTrader5 call runs on the gateway's own thread.
   Crossing into the event loop happens only through `emit_bar` and
   `_set_status`, which are the thread-safe entry points.
@@ -136,7 +173,8 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
   you.
 - Prefer explicit types and domain terminology over clever, compressed code.
 - Cover behaviour changes with focused tests, including failure paths and
-  boundary cases. Venues are faked in tests (see `tests/fakes.py`).
+  boundary cases. Venues are faked in tests (`FakeTerminal`, `FakeKlineStream`
+  in `tests/fakes.py`) — no test may open a real socket.
 
 ## Verification
 
@@ -153,9 +191,10 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
 
 ## Trading and destructive operations
 
-- Do not point the ingester at a live NATS cluster or a live MT5 account, or
-  change NATS tokens, Telegram tokens or chat ids from a session without an
-  explicit request and confirmation of the target environment.
+- Do not point the ingester at a live NATS cluster, a live MT5 account or a
+  production Binance endpoint, or change NATS tokens, Telegram tokens or chat
+  ids from a session without an explicit request and confirmation of the target
+  environment.
 - A published bar is not recallable: strategies downstream may trade on it.
   Treat any publish to a shared NATS server as a live action unless the
   environment is proven local.

@@ -4,9 +4,14 @@ ingester/runtime.py — Starts and stops everything, in order, and reports it.
 Kept apart from FastAPI so the whole lifecycle can be exercised in tests with
 fakes; ``app.py`` only calls :meth:`start` / :meth:`stop` from its lifespan.
 
-Start: notifier → NATS → every configured gateway → "running" notification.
+Start: notifier → NATS → every gateway every configured market enables →
+       "running" notification.
 Stop:  gateways (publishing what they already emitted) → "stopped"
        notification → NATS drain → notifier drain.
+
+Markets run side by side: each gateway owns its own source (the MT5 gateway a
+dedicated thread, the Binance gateway an asyncio task) and its own publish
+queue, so a venue that drops never touches the other market's bars.
 """
 
 from __future__ import annotations
@@ -85,7 +90,12 @@ class IngesterRuntime:
     await self._notifier.start()
     await self._start_error_forwarding()
 
-    problems: list[str] = []
+    # A market file that would not load is a configuration mistake, not a
+    # transient outage, so it is reported first — and the markets that *did*
+    # load still start.
+    problems: list[str] = list(self._config.market_problems)
+    for problem in problems:
+      log.error("Market configuration: %s", problem)
 
     try:
       await self._connection.connect()
@@ -95,18 +105,31 @@ class IngesterRuntime:
       log.error("NATS unavailable at start-up: %s", exc)
       problems.append(f"NATS {self._config.nats.url}: {type(exc).__name__}: {exc}")
 
-    context = IngestionContext(
-      settings=self._config, publisher=self.publisher, notifier=self._notifier
-    )
-    for gateway in dict.fromkeys(self._config.app.GATEWAYS):
+    for market, gateway, gateway_config in self._config.gateway_configs:
+      context = IngestionContext(
+        settings=self._config,
+        publisher=self.publisher,
+        notifier=self._notifier,
+        gateway_config=gateway_config,
+      )
       try:
         ingestion = self._factory.create(gateway, context)
         await ingestion.start()
       except Exception as exc:
-        log.exception("Gateway %s failed to start", gateway.value)
-        problems.append(f"{gateway.value}: {type(exc).__name__}: {exc}")
+        log.exception("Gateway %s (%s) failed to start", gateway.value, market.value)
+        problems.append(f"{market.value}/{gateway.value}: {type(exc).__name__}: {exc}")
         continue
       self.ingestions.append(ingestion)
+
+    if not self.ingestions:
+      # Up but ingesting nothing publishes no bars at all, so it must never
+      # read as healthy: every "enable = false", or an empty SOURCE_MARKET,
+      # lands here.
+      problems.append(
+        f"no gateway is ingesting: SOURCE_MARKET="
+        f"{','.join(m.value for m in self._config.source.MARKET) or '(empty)'}"
+        f" — check enable in {self._config.source.CONFIG_DIR}/<market>.toml"
+      )
 
     self.status = ServiceStatusEnum.RUNNING
     log.info("Ingester running: %s", ", ".join(self._streams()) or "no gateway")
@@ -160,8 +183,10 @@ class IngesterRuntime:
       await self._log_notifier.stop()
 
   def _streams(self) -> list[str]:
+    # The market is named too: with several markets running, "mt5" and
+    # "binance" alone leave an operator guessing which file they came from.
     return [
-      f"{snap['gateway'].upper()}: {','.join(snap['symbols'])} × "
+      f"{snap['market']}/{snap['gateway'].upper()}: {','.join(snap['symbols'])} × "
       f"{','.join(snap['timeframes'])}"
       for snap in (ingestion.snapshot() for ingestion in self.ingestions)
     ]

@@ -1,25 +1,46 @@
 """
-ingester/settings.py — Centralised settings loaded from .env / environment variables.
+ingester/settings.py — Process settings from ``.env``, market settings from TOML.
 
-Settings are grouped into focused ``*Settings`` sub-models nested under the main
-:class:`Settings` (``settings.app.PORT``, ``settings.nats.url``,
-``settings.mt5.SYMBOLS``). Each sub-model carries an ``env_prefix`` so the env
-var names stay flat — ``MT5_SYMBOLS`` populates ``settings.mt5.SYMBOLS`` — and
-can be instantiated on its own (handy for tests).
+Two layers, because they change for different reasons:
 
-Nothing about *what* to ingest is hard-coded: symbols, timeframes, the enabled
-gateways, host/port and every NATS/Telegram knob come from ``.env``.
+* **``.env``** — everything about *this process and this host*: the FastAPI
+  server, logging, NATS, Telegram, the MT5 terminal credentials, and
+  ``SOURCE_MARKET`` naming which markets to run. Grouped into focused
+  ``*Settings`` sub-models (``settings.app.PORT``, ``settings.nats.url``), each
+  carrying an ``env_prefix`` so the env var names stay flat and each one can be
+  instantiated on its own in tests.
+* **``config/<market>.toml``** — everything about *what to ingest*, per market.
+  One file per market named in ``SOURCE_MARKET`` (``config/forex.toml``,
+  ``config/crypto.toml``), one ``[gateway]`` table per gateway inside it, and
+  ``enable`` in each table deciding whether that gateway runs. The market a
+  gateway belongs to comes from the file it is written in, so it is never
+  repeated — and never contradicted — inside the table.
+
+The two meet in :class:`GatewaySettings`: the TOML table is passed as init
+arguments, which outrank the environment in pydantic-settings, so operational
+knobs come from the file while secrets (``MT5_LOGIN`` …) stay in ``.env``.
+
+Nothing about what to ingest is hard-coded: symbols, timeframes, the enabled
+markets and gateways, host/port and every NATS/Telegram knob are configuration.
 """
 
 from __future__ import annotations
 
+import re
 import socket
-from typing import Annotated, Any
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Annotated, Any, ClassVar
 
-from pydantic import Field, field_validator
+from pydantic import Field, SkipValidation, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from ingester.schemas.enums import GatewayEnum, MarketEnum, Timeframe
+
+#: A NATS stream name cannot hold a dot, space, wildcard or slash; a derived
+#: name keeps only what is always safe and replaces the rest.
+_STREAM_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 def _config(prefix: str) -> SettingsConfigDict:
@@ -34,7 +55,11 @@ def _config(prefix: str) -> SettingsConfigDict:
 
 
 def split_csv(value: Any) -> Any:
-  """Turn ``"A, B,,C"`` into ``["A", "B", "C"]``; pass lists through untouched."""
+  """Turn ``"A, B,,C"`` into ``["A", "B", "C"]``; pass lists through untouched.
+
+  Lists pass through because the same fields are also fed from TOML, where a
+  list of symbols is written as a TOML array.
+  """
   if isinstance(value, str):
     return [item.strip() for item in value.split(",") if item.strip()]
   return value
@@ -43,6 +68,14 @@ def split_csv(value: Any) -> Any:
 #: A comma-separated env var decoded into a list (``NoDecode`` stops
 #: pydantic-settings from insisting on JSON for list fields).
 CsvList = Annotated[list[str], NoDecode]
+
+
+class MarketConfigError(Exception):
+  """A market TOML file is missing, malformed or names something unknown.
+
+  Lives here rather than in ``core/errors.py`` because the core imports these
+  settings, and the import would run in a circle.
+  """
 
 
 class AppSettings(BaseSettings):
@@ -55,18 +88,41 @@ class AppSettings(BaseSettings):
   PORT: int = 8090
   #: Identifies this process in events and notifications. Empty = hostname.
   INSTANCE_ID: str = ""
-  #: Gateways started at boot, e.g. ``mt5`` or ``mt5,binance``.
-  GATEWAYS: Annotated[list[GatewayEnum], NoDecode] = [GatewayEnum.MT5]
   DOCS_ENABLED: bool = False
-
-  @field_validator("GATEWAYS", mode="before")
-  @classmethod
-  def _split_gateways(cls, value: Any) -> Any:
-    return [str(item).lower() for item in split_csv(value)]
 
   @property
   def instance_id(self) -> str:
     return self.INSTANCE_ID or socket.gethostname()
+
+
+class SourceSettings(BaseSettings):
+  """Which markets this process ingests, and where their TOML files live
+  (env prefix ``SOURCE_``).
+
+  ``SOURCE_MARKET=forex,crypto`` runs both: each market's gateways are read
+  from ``<CONFIG_DIR>/<market>.toml`` and started side by side, so one venue
+  going down never touches the other.
+  """
+
+  model_config = _config("SOURCE_")
+
+  MARKET: Annotated[list[MarketEnum], NoDecode] = [MarketEnum.FOREX]
+  CONFIG_DIR: Path = Path("config")
+
+  @field_validator("MARKET", mode="before")
+  @classmethod
+  def _split_markets(cls, value: Any) -> Any:
+    return [str(item).lower() for item in split_csv(value)]
+
+
+class ContractSettings(BaseSettings):
+  """Version stamped on every published payload (env prefix ``SCHEMA_``)."""
+
+  model_config = _config("SCHEMA_")
+
+  #: Bump on any breaking change to the payload shape. Subscribers should reject
+  #: (or route aside) a major version they do not understand.
+  VERSION: str = "1.0.0"
 
 
 class LoggingSettings(BaseSettings):
@@ -93,7 +149,6 @@ class NatsSettings(BaseSettings):
   #: Core NATS publish is fire-and-forget; JetStream persists each bar so a
   #: subscriber that was down can replay it, de-duplicated by ``event_id``.
   JETSTREAM_ENABLED: bool = False
-  STREAM_NAME: str = "INGEST"
   PUBLISH_TIMEOUT: float = 5.0
   #: How long the stream keeps a bar (only used when the stream is created).
   STREAM_MAX_AGE_SECONDS: float = 7 * 24 * 3600
@@ -102,6 +157,20 @@ class NatsSettings(BaseSettings):
   @property
   def url(self) -> str:
     return f"nats://{self.HOST}:{self.PORT}"
+
+  @property
+  def stream_name(self) -> str:
+    """JetStream stream name — derived from ``SUBJECT_PREFIX``, never set.
+
+    The stream has to listen on ``<SUBJECT_PREFIX>.>`` to accept what this
+    ingester publishes, and a stream is never reconfigured once it exists. A
+    separately configured name is therefore a silent outage waiting to happen:
+    change one and not the other and every publish is rejected. Deriving the
+    name removes the chance to get them out of step, at the cost of not being
+    able to version the stream independently of the subject tree. Only the
+    prefix's first token is used, because a stream name cannot hold a dot.
+    """
+    return _STREAM_NAME_UNSAFE.sub("_", self.SUBJECT_PREFIX.split(".", 1)[0])
 
 
 class TelegramSettings(BaseSettings):
@@ -136,13 +205,25 @@ class TelegramSettings(BaseSettings):
 
 
 class GatewaySettings(BaseSettings):
-  """What every gateway shares: which symbols and timeframes to ingest.
+  """What every gateway shares, read from its ``[gateway]`` table in a market
+  file.
 
-  Subclass per gateway with its own ``env_prefix`` and venue-specific knobs.
+  Subclass per gateway with its own ``env_prefix`` — the prefix only serves the
+  fields a venue keeps in ``.env`` (credentials, local paths); everything else
+  arrives as init arguments from the TOML table, which take precedence.
   """
 
+  #: Fields a market file may **not** set, lower-cased in the error. ``MARKET``
+  #: is the file's own name, so a table claiming another one could only
+  #: contradict it; a subclass adds its secrets and host paths, which belong in
+  #: ``.env`` and must not be invited into a file meant to be read and diffed.
+  ENV_ONLY_FIELDS: ClassVar[frozenset[str]] = frozenset({"MARKET"})
+
+  #: First key of every table: whether this market starts this gateway.
+  ENABLE: bool = False
   SYMBOLS: CsvList = []
   TIMEFRAMES: Annotated[list[Timeframe], NoDecode] = [Timeframe.M1]
+  #: Set from the name of the market file the table was read from.
   MARKET: MarketEnum
 
   @field_validator("SYMBOLS", mode="before")
@@ -157,9 +238,18 @@ class GatewaySettings(BaseSettings):
 
 
 class Mt5Settings(GatewaySettings):
-  """MetaTrader 5 terminal bridge (env prefix ``MT5_``)."""
+  """MetaTrader 5 terminal bridge — ``[mt5]`` in a market file, credentials
+  from ``.env`` (prefix ``MT5_``)."""
 
   model_config = _config("MT5_")
+
+  ENV_ONLY_FIELDS: ClassVar[frozenset[str]] = GatewaySettings.ENV_ONLY_FIELDS | {
+    "TERMINAL_PATH",
+    "LOGIN",
+    "PASSWORD",
+    "SERVER",
+    "TIMEOUT_MS",
+  }
 
   MARKET: MarketEnum = MarketEnum.FOREX
   #: Forces the broker's affix when auto-detection is ambiguous (Exness: ``m``,
@@ -192,6 +282,185 @@ class Mt5Settings(GatewaySettings):
     return None if value in ("", None) else value
 
 
+class BinanceSettings(GatewaySettings):
+  """Binance kline websocket — ``[binance]`` in a market file (prefix
+  ``BINANCE_``).
+
+  Binance pushes a kline update several times a second and marks the final one
+  ``x: true``; only that one is a closed bar, so no polling interval is needed.
+  """
+
+  model_config = _config("BINANCE_")
+
+  MARKET: MarketEnum = MarketEnum.CRYPTO
+  #: Combined-stream endpoint. ``wss://testnet.binance.vision/stream`` for the
+  #: testnet; ``wss://fstream.binance.com/stream`` for USD-M futures.
+  WS_URL: str = "wss://stream.binance.com:9443/stream"
+  #: Publish the closed bars the REST klines endpoint reports at start-up
+  #: instead of waiting for the websocket's first close. Recovers the bars a
+  #: crash or restart would otherwise skip, bounded by ``CATCHUP_BARS``. Safe
+  #: with JetStream, which de-duplicates on ``event_id``.
+  BACKFILL_ON_START: bool = False
+  #: Closed bars read per stream by that backfill — how long an outage it can
+  #: recover is this × the timeframe. Only used when ``BACKFILL_ON_START`` is
+  #: on: the websocket needs no catch-up window, it pushes every close. 1000
+  #: is Binance's own per-request limit.
+  CATCHUP_BARS: int = Field(default=5, ge=1, le=1000)
+  #: The full REST klines endpoint the backfill reads, because its path differs
+  #: per product: ``https://testnet.binance.vision/api/v3/klines`` for the
+  #: testnet, ``https://fapi.binance.com/fapi/v1/klines`` for USD-M futures.
+  #: Keep it on the same product as ``WS_URL`` or the two disagree about which
+  #: book the bars came from.
+  KLINES_URL: str = "https://api.binance.com/api/v3/klines"
+  #: Seconds a single backfill request may take.
+  HTTP_TIMEOUT_SECONDS: float = 10.0
+  #: Seconds before a dropped socket is dialled again.
+  RECONNECT_INTERVAL_SECONDS: float = 5.0
+  #: Websocket keep-alive. Binance answers pings; a silent peer is dropped
+  #: after PING_TIMEOUT so the reconnect loop can take over.
+  PING_INTERVAL_SECONDS: float = 20.0
+  PING_TIMEOUT_SECONDS: float = 20.0
+  #: Seconds without any message before the connection counts as dead. Binance
+  #: pushes kline updates continuously, so silence means the socket is a husk.
+  IDLE_TIMEOUT_SECONDS: float = 90.0
+
+
+#: Gateway → the settings class that validates its ``[gateway]`` table. A new
+#: venue adds its class above and one row here; nothing else parses config.
+GATEWAY_SETTINGS: dict[GatewayEnum, type[GatewaySettings]] = {
+  GatewayEnum.MT5: Mt5Settings,
+  GatewayEnum.BINANCE: BinanceSettings,
+}
+
+
+@dataclass(frozen=True)
+class MarketSettings:
+  """One market file: the gateways it enables, in the order they are written.
+
+  A plain dataclass, not a pydantic model: the values are ``GatewaySettings``
+  *subclasses* and pydantic would validate them back down to the base class,
+  dropping every venue-specific field.
+  """
+
+  market: MarketEnum
+  gateways: dict[GatewayEnum, GatewaySettings] = field(default_factory=dict)
+
+
+def market_config_path(market: MarketEnum, config_dir: Path) -> Path:
+  return config_dir / f"{market.value}.toml"
+
+
+def load_market(market: MarketEnum, config_dir: Path) -> MarketSettings:
+  """Read ``<config_dir>/<market>.toml`` and return its **enabled** gateways.
+
+  Raises :class:`MarketConfigError` for anything an operator can fix: a missing
+  file, broken TOML, a table that is not a known gateway, a mistyped key or a
+  value the gateway's settings reject. Loud beats a market that silently
+  ingests nothing.
+  """
+  path = market_config_path(market, config_dir)
+  try:
+    with path.open("rb") as handle:
+      tables = tomllib.load(handle)
+  except FileNotFoundError:
+    example = path.with_suffix(".example.toml")
+    # Only point at a template that is actually there: SOURCE_CONFIG_DIR can
+    # name a directory the committed templates were never copied to.
+    hint = f"copy {example} to {path}" if example.is_file() else f"create {path}"
+    raise MarketConfigError(
+      f"market {market.value!r}: {path} is missing ({hint})"
+    ) from None
+  except (OSError, tomllib.TOMLDecodeError) as exc:
+    raise MarketConfigError(
+      f"market {market.value!r}: cannot read {path}: {exc}"
+    ) from None
+
+  gateways: dict[GatewayEnum, GatewaySettings] = {}
+  for name, table in tables.items():
+    if not isinstance(table, dict):
+      raise MarketConfigError(
+        f"{path}: {name!r} must be a gateway table, written as [{name}]"
+      )
+    try:
+      gateway = GatewayEnum(name.lower())
+    except ValueError:
+      known = ", ".join(g.value for g in GATEWAY_SETTINGS)
+      raise MarketConfigError(
+        f"{path}: unknown gateway table [{name}] (known gateways: {known})"
+      ) from None
+
+    settings_class = GATEWAY_SETTINGS[gateway]
+    # TOML is written in lower case; the settings fields are upper case. The
+    # market is not in the table at all — it is the file this table lives in.
+    values = {key.upper(): value for key, value in table.items()}
+    unknown = sorted(
+      key.lower() for key in values if key not in settings_class.model_fields
+    )
+    if unknown:
+      raise MarketConfigError(
+        f"{path}: [{name}] has unknown key(s): {', '.join(unknown)}"
+      )
+    # Accepting these from a market file would mean a table that contradicts
+    # its own file, or a secret written into a diffable file — so they are
+    # refused rather than quietly overwritten.
+    refused = sorted(
+      key.lower() for key in values if key in settings_class.ENV_ONLY_FIELDS
+    )
+    if refused:
+      raise MarketConfigError(
+        f"{path}: [{name}] must not set {', '.join(refused)} — the market is "
+        f"this file's name and the rest belongs in .env as "
+        f"{name.upper()}_<KEY>"
+      )
+    values["MARKET"] = market
+    try:
+      config = settings_class(**values)
+    except ValidationError as exc:
+      raise MarketConfigError(f"{path}: [{name}] is invalid: {exc}") from None
+
+    if config.ENABLE:
+      gateways[gateway] = config
+  return MarketSettings(market=market, gateways=gateways)
+
+
+def load_markets(
+  markets: list[MarketEnum], config_dir: Path
+) -> tuple[dict[MarketEnum, MarketSettings], list[str]]:
+  """Load every market, collecting failures instead of raising.
+
+  One unreadable market file must not stop the markets that *are* configured:
+  the runtime starts what loaded and reports the rest as **Ingester Degraded**.
+
+  A gateway enabled in two markets is refused in the second: venue SDKs are
+  process-global (one ``MetaTrader5`` session, which either ingestion's
+  ``shutdown()`` would pull out from under the other) and ``event_id`` carries
+  no market, so two instances of one gateway would publish colliding ids.
+  """
+  loaded: dict[MarketEnum, MarketSettings] = {}
+  problems: list[str] = []
+  claimed: dict[GatewayEnum, MarketEnum] = {}
+  for market in dict.fromkeys(markets):
+    try:
+      market_settings = load_market(market, config_dir)
+    except MarketConfigError as exc:
+      problems.append(str(exc))
+      continue
+    gateways: dict[GatewayEnum, GatewaySettings] = {}
+    for gateway, config in market_settings.gateways.items():
+      owner = claimed.get(gateway)
+      if owner is not None:
+        problems.append(
+          f"gateway {gateway.value!r} is enabled in both {owner.value!r} and "
+          f"{market.value!r}; only the {owner.value!r} one runs — set "
+          f"enable = false in {market_config_path(market, config_dir)}"
+        )
+        continue
+      claimed[gateway] = market
+      gateways[gateway] = config
+    loaded[market] = MarketSettings(market=market, gateways=gateways)
+  return loaded, problems
+
+
 class Settings(BaseSettings):
   """Application-wide configuration, grouped into nested ``*Settings`` models."""
 
@@ -202,10 +471,32 @@ class Settings(BaseSettings):
   )
 
   app: AppSettings = Field(default_factory=AppSettings)
+  source: SourceSettings = Field(default_factory=SourceSettings)
+  contract: ContractSettings = Field(default_factory=ContractSettings)
   logging: LoggingSettings = Field(default_factory=LoggingSettings)
   nats: NatsSettings = Field(default_factory=NatsSettings)
   telegram: TelegramSettings = Field(default_factory=TelegramSettings)
-  mt5: Mt5Settings = Field(default_factory=Mt5Settings)
+  #: Market → its enabled gateways, read from the market TOML files. Skipping
+  #: validation keeps the ``GatewaySettings`` subclasses intact; tests pass
+  #: their own markets in and no file is read.
+  markets: SkipValidation[dict[MarketEnum, MarketSettings] | None] = None
+  #: One line per market that could not be loaded, reported at start-up.
+  market_problems: SkipValidation[list[str]] = Field(default_factory=list)
+
+  def model_post_init(self, _context: Any) -> None:
+    if self.markets is None:
+      markets, problems = load_markets(self.source.MARKET, self.source.CONFIG_DIR)
+      self.markets = markets
+      self.market_problems = problems
+
+  @property
+  def gateway_configs(self) -> list[tuple[MarketEnum, GatewayEnum, GatewaySettings]]:
+    """Every enabled gateway across every loaded market, in configured order."""
+    return [
+      (market.market, gateway, config)
+      for market in (self.markets or {}).values()
+      for gateway, config in market.gateways.items()
+    ]
 
 
 settings = Settings()

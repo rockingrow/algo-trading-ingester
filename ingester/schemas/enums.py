@@ -23,7 +23,6 @@ class MarketEnum(StrEnum):
   """Asset class of the instrument, so a subscriber can route without a lookup."""
 
   FOREX = "forex"
-  CFD = "cfd"
   CRYPTO = "crypto"
 
 

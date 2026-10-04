@@ -15,8 +15,8 @@ other.
 ## Before handing work back
 
 - `/code-review` on the diff before the branch is proposed for a PR into `dev`.
-- `/security-review` when the change touches `.env` handling, MT5 credentials,
-  Telegram tokens, or anything published to NATS.
+- `/security-review` when the change touches `.env` or `config/*.toml` handling,
+  MT5 credentials, Telegram tokens, or anything published to NATS.
 - Push to the working branch and report the commands you ran, including the
   test baseline comparison AGENTS.md asks for.
 
@@ -26,9 +26,12 @@ Use plan mode, and confirm the approach, before editing:
 
 - `ingester/schemas/` — the wire contract `qte-ingest` decodes; a change here
   is a change for a consumer this repository cannot see.
-- `ingester/gateways/mt5/{ingestion,dto}.py` — bar-close detection and the
+- `ingester/gateways/forex/mt5/{ingestion,dto}.py` — bar-close detection and the
   server-time → UTC conversion; a mistake here silently drops, duplicates or
   time-shifts the bars strategies trade on.
+- `ingester/gateways/crypto/binance/{ingestion,dto}.py` — the same risk on the crypto
+  side: the `k.x` close flag, the per-stream de-duplication and the
+  millisecond → UTC conversion.
 - `ingester/core/ingestion.py` — every gateway inherits it, and it owns the
   thread → event-loop hand-off.
 

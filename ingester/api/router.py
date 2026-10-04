@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from ingester import __version__
-from ingester.schemas.market_event_schema import SCHEMA_VERSION
+from ingester.settings import settings
 
 router = APIRouter()
 
@@ -33,7 +33,7 @@ async def status(request: Request) -> dict[str, Any]:
   return {
     "instance_id": state.instance_id,
     "version": __version__,
-    "schema_version": SCHEMA_VERSION,
+    "schema_version": settings.contract.VERSION,
     "nats": {
       "connected": state.publisher.is_connected,
       "subject_filter": state.publisher.subject_filter,

@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────────
+# Crypto market — copy to config/crypto.toml and edit.
+#
+# Loaded when SOURCE_MARKET in .env lists "crypto". Every table below is one
+# gateway; "enable" decides whether this market starts it. The market itself is
+# not written here — it is the name of this file, and a table that sets "market"
+# is refused at start-up rather than quietly accepted.
+# ─────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+# Binance kline websocket (runs on any OS, needs no API key: the
+# market-data streams are public)
+# ─────────────────────────────────────────────────────────────────
+[binance]
+enable = true
+
+# Binance spells its pairs without a separator and in upper case. The name
+# written here is the one published, and therefore the one in event_id.
+symbols = ["BTCUSDT", "ETHUSDT"]
+
+# Any of: M1, M5, M15, M30, H1, H4, D1, W1 — mapped onto Binance's own
+# interval spelling (M15 → 15m) by the gateway.
+timeframes = ["M5", "M15"]
+
+# Combined-stream endpoint. Spot mainnet by default:
+#   wss://testnet.binance.vision/stream   — testnet
+#   wss://fstream.binance.com/stream      — USD-M futures
+ws_url = "wss://stream.binance.com:9443/stream"
+
+# The websocket only carries bars that close while it is connected, so by
+# default the bars that closed before this process started are never published.
+# true = read them back from Binance's REST klines endpoint once the socket is
+# open and publish them first, so a subscriber gets backfill + live bars as one
+# series. Turn NATS_JETSTREAM_ENABLED on with it: bars the previous process
+# already sent are republished, and JetStream drops them by event_id.
+backfill_on_start = true
+
+# Closed bars read per stream by that backfill — the recovery window is this ×
+# the timeframe: 16 bars of M15 = 4 hours. Only used when backfill_on_start is
+# true; the live socket needs no catch-up window. Max 1000 (Binance's own
+# per-request limit).
+catchup_bars = 16
+
+# The full REST klines endpoint that backfill reads. Its path differs per
+# product, so it is written out rather than derived from ws_url:
+#   https://testnet.binance.vision/api/v3/klines   — testnet
+#   https://fapi.binance.com/fapi/v1/klines        — USD-M futures
+# Keep it on the same product as ws_url, or the two disagree about which book
+# the bars came from.
+klines_url = "https://api.binance.com/api/v3/klines"
+
+# Seconds a single backfill request may take
+http_timeout_seconds = 10.0
+
+# Seconds before a dropped socket is dialled again
+reconnect_interval_seconds = 5.0
+
+# Websocket keep-alive. Binance answers pings; a peer that stops answering is
+# dropped after ping_timeout_seconds so the reconnect loop can take over.
+ping_interval_seconds = 10.0
+ping_timeout_seconds = 20.0
+
+# Seconds without any message before the connection counts as dead. Binance
+# pushes kline updates continuously, so silence means the socket is a husk.
+# Keep it well above the slowest expected update, or a healthy stream is cut.
+idle_timeout_seconds = 90.0

@@ -52,6 +52,123 @@ class FakeConnection:
     self.closed = True
 
 
+def kline(
+  open_time_ms: int,
+  *,
+  symbol: str = "BTCUSDT",
+  interval: str = "1m",
+  price: float = 100.0,
+  closed: bool = True,
+  combined: bool = True,
+) -> dict[str, Any]:
+  """A Binance combined-stream frame carrying one kline update.
+
+  Prices are strings, as Binance sends them. ``combined=False`` gives the bare
+  event, the shape a single ``<symbol>@kline_<interval>`` stream delivers.
+  """
+  candle = {
+    "t": open_time_ms,
+    # Binance's close time is one millisecond before the next bar opens.
+    "T": open_time_ms + 59_999,
+    "s": symbol,
+    "i": interval,
+    "o": f"{price}",
+    "c": f"{price + 0.5}",
+    "h": f"{price + 1}",
+    "l": f"{price - 1}",
+    "v": "1.5",
+    "q": "150.0",
+    "n": 42,
+    "x": closed,
+  }
+  event = {"e": "kline", "E": open_time_ms + 60_000, "s": symbol, "k": candle}
+  if not combined:
+    return event
+  return {"stream": f"{symbol.lower()}@kline_{interval}", "data": event}
+
+
+def rest_kline(
+  open_time_ms: int, *, price: float = 100.0, interval_ms: int = 60_000
+) -> list:
+  """One row of Binance's REST klines response — positional, prices as strings.
+
+  ``close_time`` is the bar's last millisecond, as Binance reports it.
+  """
+  return [
+    open_time_ms,
+    f"{price}",
+    f"{price + 1}",
+    f"{price - 1}",
+    f"{price + 0.5}",
+    "1.5",
+    open_time_ms + interval_ms - 1,
+    "150.0",
+    42,
+    "0",
+    "0",
+    "0",
+  ]
+
+
+class FakeKlineHistory:
+  """Scriptable stand-in for Binance's REST klines endpoint.
+
+  Rows are scripted per ``(symbol, interval)``; an unscripted stream answers
+  with none, and :attr:`error` is raised instead of answering at all.
+  """
+
+  def __init__(self, rows: dict[tuple[str, str], list] | None = None) -> None:
+    self.rows: dict[tuple[str, str], list] = dict(rows or {})
+    self.calls: list[tuple[str, str, int]] = []
+    #: Raised by every :meth:`klines` call while it is set.
+    self.error: Exception | None = None
+
+  def set_rows(self, symbol: str, interval: str, rows: list) -> None:
+    self.rows[(symbol, interval)] = list(rows)
+
+  async def klines(self, *, symbol: str, interval: str, limit: int) -> list:
+    self.calls.append((symbol, interval, limit))
+    if self.error is not None:
+      raise self.error
+    return list(self.rows.get((symbol, interval), []))[-limit:]
+
+
+class FakeKlineStream:
+  """Scriptable stand-in for a Binance websocket.
+
+  Frames are queued up front or pushed while the ingestion runs; a queued
+  ``Exception`` is raised out of :meth:`receive`, which is how a test drops the
+  socket. An exhausted queue simply blocks, like a quiet connection.
+  """
+
+  def __init__(self, frames: list[Any] | None = None) -> None:
+    self.queue: asyncio.Queue[Any] = asyncio.Queue()
+    for frame in frames or []:
+      self.queue.put_nowait(frame)
+    self.opened: list[tuple[str, list[str]]] = []
+    self.close_calls = 0
+    #: Raised by the next :meth:`open` call, then cleared.
+    self.open_error: Exception | None = None
+
+  def push(self, frame: Any) -> None:
+    self.queue.put_nowait(frame)
+
+  async def open(self, url: str, streams: Any) -> None:
+    self.opened.append((url, list(streams)))
+    if self.open_error is not None:
+      error, self.open_error = self.open_error, None
+      raise error
+
+  async def receive(self) -> Any:
+    frame = await self.queue.get()
+    if isinstance(frame, Exception):
+      raise frame
+    return frame
+
+  async def close(self) -> None:
+    self.close_calls += 1
+
+
 def rate(time: int, price: float = 1.0) -> dict[str, Any]:
   """An MT5-shaped rate record."""
   return {

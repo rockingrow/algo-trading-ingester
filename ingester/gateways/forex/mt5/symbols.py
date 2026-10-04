@@ -1,9 +1,9 @@
 """
-ingester/gateways/mt5/symbols.py — Configured symbol → the broker's own name.
+ingester/gateways/forex/mt5/symbols.py — Configured symbol → the broker's own name.
 
 Brokers decorate instrument names: Exness sells XAUUSD as ``XAUUSDm``, others
 use ``XAUUSD.raw``, ``XAUUSDc`` or a prefix. Naming the bare instrument in
-``.env`` keeps configuration — and therefore every NATS subject — free of one
+The market file keeps configuration — and therefore every NATS subject — free of one
 broker's spelling, so this module maps ``XAUUSD`` onto whatever the terminal
 actually offers.
 
@@ -29,7 +29,8 @@ def resolve_symbol(base: str, candidates: Iterable[str], suffix: str = "") -> st
 
   1. *suffix* configured — ``base + suffix`` must exist, or it is an error. An
      explicit setting is never silently overruled by a guess.
-  2. An exact match — so a fully-spelled ``XAUUSDm`` in ``.env`` still works.
+  2. An exact match — so a fully-spelled ``XAUUSDm`` in the market file still
+     works.
   3. The shortest name that adds an affix to *base*, suffix or prefix.
 
   Raises :class:`SymbolResolutionError` when nothing matches, or when several
@@ -64,7 +65,7 @@ def resolve_symbol(base: str, candidates: Iterable[str], suffix: str = "") -> st
   if len(best) > 1:
     raise SymbolResolutionError(
       f"{base!r} is ambiguous — {_listed(best)} are equally close; "
-      f"set MT5_SYMBOL_SUFFIX or name the instrument in full"
+      f"set symbol_suffix in the [mt5] table or name the instrument in full"
     )
   return best[0]
 

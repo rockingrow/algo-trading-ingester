@@ -26,9 +26,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ingester.schemas.enums import EventTypeEnum, GatewayEnum, MarketEnum, Timeframe
 
-#: Bumped on any breaking change to the payload shape. Subscribers should
-#: reject (or route aside) a major version they do not understand.
-SCHEMA_VERSION = "2.0"
+
+def _schema_version() -> str:
+  """The configured ``SCHEMA_VERSION``. Imported lazily because
+  ``ingester.settings`` imports this package for its enums."""
+  from ingester.settings import settings
+
+  return settings.contract.VERSION
+
 
 # NATS treats ``.`` as a token separator and ``*``/``>`` as wildcards, and
 # brokers love symbol suffixes such as ``XAUUSD.m`` — so a symbol is reduced to
@@ -111,7 +116,7 @@ class MarketEvent(BaseModel):
 
   model_config = ConfigDict(frozen=True)
 
-  schema_version: str = SCHEMA_VERSION
+  schema_version: str = Field(default_factory=_schema_version)
   #: Deterministic id — the same bar always yields the same id, so it doubles as
   #: the JetStream ``Nats-Msg-Id`` and a subscriber-side de-duplication key.
   event_id: str

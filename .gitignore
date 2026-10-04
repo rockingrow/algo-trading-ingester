@@ -219,3 +219,9 @@ __marimo__/
 
 # ====== Runtime logs ======
 logs/
+
+# ====== Market configuration ======
+# config/<market>.toml is the operator's own file (symbols, timeframes, the
+# gateways a market enables); only the *.example.toml templates are committed.
+config/*.toml
+!config/*.example.toml
