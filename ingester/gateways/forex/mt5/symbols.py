@@ -1,5 +1,5 @@
 """
-ingester/gateways/mt5/symbols.py — Configured symbol → the broker's own name.
+ingester/gateways/forex/mt5/symbols.py — Configured symbol → the broker's own name.
 
 Brokers decorate instrument names: Exness sells XAUUSD as ``XAUUSDm``, others
 use ``XAUUSD.raw``, ``XAUUSDc`` or a prefix. Naming the bare instrument in

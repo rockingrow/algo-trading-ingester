@@ -1,5 +1,5 @@
 """
-ingester/gateways/binance/dto.py — Binance kline → canonical :class:`Bar`.
+ingester/gateways/crypto/binance/dto.py — Binance kline → canonical :class:`Bar`.
 
 The one place that knows what a Binance kline looks like. A combined-stream
 frame nests the event under ``data``, and the kline under ``data.k``, with
@@ -17,6 +17,11 @@ single-letter keys fixed by Binance's contract:
 ``x``      true on the final update of a bar — the close
 =========  ====================================================
 
+The REST klines endpoint carries the same bar as a positional array instead of
+a keyed object — same fields, same units, no ``x`` flag — and
+:meth:`BinanceKlineDTO.from_rest_row` is the one place that knows which index
+holds what.
+
 Binance already stamps milliseconds in UTC, so there is no timezone to guess
 (unlike MT5). The canonical ``close_time`` is derived as
 ``open_time + timeframe`` rather than taken from ``T``: Binance's ``T`` is one
@@ -26,10 +31,13 @@ venues should not have to know that.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ConfigDict, Field
 
+from ingester.core.dto import BaseBarDTO
 from ingester.schemas.enums import Timeframe
 from ingester.schemas.market_event_schema import Bar
 
@@ -52,7 +60,7 @@ INTERVAL_TIMEFRAMES: dict[str, Timeframe] = {
 }
 
 
-class BinanceKlineDTO(BaseModel):
+class BinanceKlineDTO(BaseBarDTO):
   """One validated kline from a ``<symbol>@kline_<interval>`` stream.
 
   Field names are ours; the aliases are Binance's. Prices arrive as strings and
@@ -60,9 +68,9 @@ class BinanceKlineDTO(BaseModel):
   on the wire, and a float is what the canonical ``Bar`` carries.
   """
 
-  model_config = ConfigDict(
-    frozen=True, extra="ignore", populate_by_name=True, allow_inf_nan=False
-  )
+  # On top of the base config: fields can be set by our names as well as by
+  # Binance's single-letter aliases.
+  model_config = ConfigDict(populate_by_name=True)
 
   open_time_ms: int = Field(alias="t", ge=0)
   close_time_ms: int = Field(alias="T", ge=0)
@@ -80,6 +88,35 @@ class BinanceKlineDTO(BaseModel):
   #: ``true`` only on the final update of a bar. Anything else is a bar still
   #: forming, and publishing it would hand strategies an unfinished candle.
   is_closed: bool = Field(alias="x", default=False)
+
+  @classmethod
+  def from_rest_row(
+    cls, row: Sequence[Any], *, symbol: str, interval: str, now_ms: int
+  ) -> BinanceKlineDTO:
+    """One kline from the REST endpoint, whose rows are positional arrays.
+
+    The symbol and interval are not in the row — they were the request — and
+    neither is ``x``: REST returns the bar still forming like any other. It is
+    recognised by its close time, which Binance sets to the bar's last
+    millisecond, so a bar is closed exactly once *now* is past it.
+    """
+    if len(row) < 9:
+      raise ValueError(f"Binance kline row has {len(row)} field(s), expected 9+")
+    close_time_ms = int(row[6])
+    return cls(
+      open_time_ms=int(row[0]),
+      close_time_ms=close_time_ms,
+      symbol=symbol,
+      interval=interval,
+      open=row[1],
+      high=row[2],
+      low=row[3],
+      close=row[4],
+      volume=row[5],
+      quote_volume=row[7],
+      trade_count=int(row[8]),
+      is_closed=close_time_ms < now_ms,
+    )
 
   @property
   def timeframe(self) -> Timeframe | None:

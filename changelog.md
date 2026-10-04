@@ -2,11 +2,64 @@
 
 ## Unreleased
 
-### Breaking — schema `2.0`
+### Configuration — the payload schema version is a setting
+
+- `SCHEMA_VERSION` moves out of `market_event_schema.py` into `.env`
+  (`SCHEMA_VERSION=1.0.0`, read as `settings.contract.VERSION`). The default is
+  unchanged, so the published payload is too. The `SCHEMA_VERSION` constant is
+  no longer exported from `ingester.schemas`.
+
+### Configuration — the JetStream stream name is derived, not configured
+
+- `NATS_STREAM_NAME` is gone. The JetStream stream is now named after the first
+  token of `NATS_SUBJECT_PREFIX`, because it has to listen on
+  `<NATS_SUBJECT_PREFIX>.>` to accept a publish and a stream is never
+  reconfigured once created — two separate settings meant one could be changed
+  without the other, rejecting every publish long after the edit. Operators
+  whose prefix and stream name already matched (the template's `INGEST`) see no
+  change; anyone who had them differ keeps publishing under the prefix and a
+  stream named after it is created, leaving the old stream's bars behind. Remove
+  the line from `.env`; a leftover one is ignored.
+
+### Internal — gateways grouped by market
+
+- Venue packages moved under the market they serve:
+  `ingester/gateways/mt5` → `ingester/gateways/forex/mt5` and
+  `ingester/gateways/binance` → `ingester/gateways/crypto/binance`. Import
+  paths change accordingly and the old ones are gone, and so do the logger
+  names printed in the log files and the Telegram error chat
+  (`ingester.gateways.mt5.ingestion` → `ingester.gateways.forex.mt5.ingestion`)
+  — update any log filter that matches them. Configuration and the published
+  payload do not change.
+- `IngestionContext.ingestion_dependencies()` hands every gateway builder the
+  shared publisher, notifier and instance id, replacing the copies each builder
+  carried.
+
+### Internal — shared gateway bases
+
+- `AsyncStreamIngestion` in `core/ingestion.py` owns the connect → receive →
+  reconnect loop for asyncio venues; `BinanceIngestion` extends it and keeps
+  only its frame handling. Its log lines now name the gateway from
+  `GatewayEnum` (`binance connect failed`) instead of `Binance …`.
+- Per-stream de-duplication moved into `BaseIngestion` (`_is_new_bar`,
+  `_remember_bar`), used by both gateways. The MT5 gateway now remembers each
+  bar as it is emitted rather than once per poll, so a record that fails
+  mid-window no longer causes the bars before it to be published twice.
+- `BaseBarDTO` in `core/dto.py` is the base of `Mt5RateDTO` and
+  `BinanceKlineDTO`.
+
+### Removed — `cfd` market
+
+- `MarketEnum.CFD` is gone: `SOURCE_MARKET` accepts `forex` and `crypto` only,
+  and `cfd` in it is now refused at start-up. No gateway ever published
+  `source.market = "cfd"`, so the payload a subscriber receives is unchanged
+  and `SCHEMA_VERSION` stays `1.0`; a subscriber that lists the accepted
+  market values can drop `cfd`.
+
+### Breaking — schema `1.0`
 
 - Renamed `source.ingestor_id` to `source.ingester_id` in every published
   event. `qte-ingest` must read the new field name.
-- `SCHEMA_VERSION` bumped from `1.0` to `2.0`.
 
 ### Breaking — configuration
 
@@ -68,6 +121,28 @@ The published payload is unchanged — `SCHEMA_VERSION` stays `2.0` and
   market, so `mt5` and `binance` streams are traceable to their file.
 - `websockets` is now a direct dependency (it was already present through
   `uvicorn[standard]`); the Binance gateway imports it.
+
+### Added (Binance)
+
+- **`[binance].backfill_on_start` and `[binance].catchup_bars`.** The kline
+  websocket only carries bars that close while it is connected, so the bars
+  that closed before start-up were never published. With
+  `backfill_on_start = true` the gateway reads the last `catchup_bars` closed
+  bars per stream from Binance's REST klines endpoint — once the socket is
+  open, so no bar falls between the two — and publishes them before the live
+  ones: a subscriber sees backfill and current bars as one continuous series.
+  Only streams nothing has been published for yet are read, so a reconnect
+  does not re-read what the socket already delivered, and a REST failure is
+  logged without costing the live socket. Both default to off/5, so the
+  behaviour of an existing `config/crypto.toml` does not change. Pair it with
+  JetStream, which drops the replayed duplicates by `event_id`.
+- **`[binance].klines_url` and `[binance].http_timeout_seconds`.** The REST
+  endpoint that backfill reads, written out in full because its path differs
+  per product (`/api/v3/klines` on spot and the testnet, `/fapi/v1/klines` on
+  USD-M futures). Keep it on the same product as `ws_url`.
+- `BinanceKlineDTO.from_rest_row()` reads Binance's positional REST rows;
+  `KlineHistory` in `gateways/crypto/binance/history.py` is the HTTP seam,
+  faked in tests like the websocket.
 
 ### Added (MT5)
 

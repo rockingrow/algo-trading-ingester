@@ -119,12 +119,14 @@ flowchart LR
 | --- | --- | --- |
 | Lifecycle, hand-off queue, publishing, status + notifications | `core/ingestion.py` → `BaseIngestion` | Template Method |
 | Blocking SDK on a dedicated thread with reconnects | `core/ingestion.py` → `ThreadedIngestion` | Template Method |
+| Asyncio feed on one task with reconnects | `core/ingestion.py` → `AsyncStreamIngestion` | Template Method |
+| Per-stream de-duplication of emitted bars | `core/ingestion.py` → `BaseIngestion._is_new_bar` / `_remember_bar` | — |
 | Pick gateways by name, once per market that enables them | `core/factory.py` → `IngestionFactory` | Factory / Registry |
 | Market files → validated per-gateway settings | `settings.py` → `load_market`, `GATEWAY_SETTINGS` | Registry |
 | Contracts between layers | `interfaces/` (`EventPublisher`, `Notifier`, `Ingestion`, `BarDTO`) | Interface (Protocol) / DIP |
-| Venue payload → canonical schema | `gateways/<venue>/dto.py` | DTO |
-| Venue business logic only | `gateways/<venue>/ingestion.py` | — |
-| Venue SDK / socket seam, so tests need no network | `gateways/mt5/terminal.py`, `gateways/binance/stream.py` | Adapter (Protocol) |
+| Venue payload → canonical schema | `gateways/<market>/<venue>/dto.py`, extending `core/dto.py` → `BaseBarDTO` | DTO |
+| Venue business logic only | `gateways/<market>/<venue>/ingestion.py` | — |
+| Venue SDK / socket / REST seam, so tests need no network | `gateways/forex/mt5/terminal.py`, `gateways/crypto/binance/{stream,history}.py` | Adapter (Protocol) |
 | Non-blocking Telegram | `services/notification_service.py` → `QueuedNotifier` | Decorator |
 | Wiring concrete classes | `providers.py` | Composition root |
 
@@ -177,14 +179,27 @@ timeframe and emits the bars Binance marks closed.
 - **`close_time`** is derived as `open_time + timeframe`, not taken from
   Binance's `T` — which is one millisecond short of the next bar's open. A
   subscriber comparing venues should not have to know that.
+- **Start-up**: the socket only carries bars that close while it is connected,
+  so by default the bars that closed before this process started are not
+  published. With `backfill_on_start = true` the gateway reads the last
+  `catchup_bars` closed bars per stream from the REST endpoint at
+  `klines_url` — after the socket is open, so no bar falls between the two —
+  and publishes them first, giving a subscriber backfill and live bars as one
+  continuous series. Only streams nothing has been published for yet are read,
+  so a reconnect re-reads nothing; a REST failure is logged and skipped rather
+  than costing the live socket. Pair it with JetStream, which drops the
+  replayed duplicates by `event_id`.
 - **De-duplication**: the newest open time emitted per stream is remembered, so
   a reconnect that replays a bar, or a repeated final update, publishes once.
 - **Reconnects**: Binance closes a connection after 24 hours, and a socket that
   goes quiet for `idle_timeout_seconds` is dropped; either way the gateway
   dials again every `reconnect_interval_seconds`. Keep `idle_timeout_seconds`
   well above the slowest expected update, or a healthy stream is cut.
-- **No credentials**: the kline streams are public. Point `ws_url` at
-  `wss://testnet.binance.vision/stream` to test against the testnet.
+- **No credentials**: the kline streams and the klines endpoint are both
+  public. Point `ws_url` at `wss://testnet.binance.vision/stream` and
+  `klines_url` at `https://testnet.binance.vision/api/v3/klines` to test
+  against the testnet — keep the two on the same product, or they disagree
+  about which book the bars came from.
 
 ---
 
@@ -210,7 +225,7 @@ all times UTC. Full examples:
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | `2.0` — bumped on breaking changes |
+| `schema_version` | `1.0` — bumped on breaking changes |
 | `event_id` | `<gateway>:<symbol>:<tf>:<open epoch>` — deterministic; de-dup key and JetStream `Nats-Msg-Id` |
 | `event_type` | `bar.closed` |
 | `source` | `gateway`, `market` (the file it was configured in), `ingester_id`, `venue` (MT5 trade server, or the Binance endpoint host) |
@@ -221,10 +236,13 @@ Venue-specific fields are `null` rather than zero when a venue does not have
 them (MT5 has no `quote_volume`, Binance has no `spread`).
 
 **Delivery** — core NATS by default (fire-and-forget). With
-`NATS_JETSTREAM_ENABLED=true`, bars are persisted on stream `NATS_STREAM_NAME`
-(created if missing, never reconfigured) and de-duplicated by `event_id`. One
-stream and one subject tree carry every market: `market` and `gateway` tell a
-subscriber what it is looking at, so nothing downstream branches per venue.
+`NATS_JETSTREAM_ENABLED=true`, bars are persisted on a stream named after
+`NATS_SUBJECT_PREFIX` (created if missing, never reconfigured) and
+de-duplicated by `event_id`. The stream name is derived from the prefix rather
+than configured separately, so it can never drift from the subjects it has to
+carry. One stream and one subject tree carry every market: `market` and
+`gateway` tell a subscriber what it is looking at, so nothing downstream
+branches per venue.
 
 ---
 
@@ -316,6 +334,10 @@ enable = true
 symbols = ["BTCUSDT", "ETHUSDT"]
 timeframes = ["M1", "M15", "H1"]
 ws_url = "wss://stream.binance.com:9443/stream"
+backfill_on_start = true
+catchup_bars = 16                # only used by the backfill; max 1000
+klines_url = "https://api.binance.com/api/v3/klines"
+http_timeout_seconds = 10.0
 reconnect_interval_seconds = 5.0
 ping_interval_seconds = 20.0
 ping_timeout_seconds = 20.0
@@ -355,23 +377,29 @@ A new venue needs only its own business logic. Take Kraken as the example:
    `MARKET`), then add one row to `GATEWAY_SETTINGS`. The prefix only serves
    keys that belong in `.env` — credentials and host paths; everything else
    comes from the market file.
-3. **Venue seam** — `gateways/kraken/{terminal,stream}.py`: a `Protocol` for
+3. **Venue seam** — `gateways/crypto/kraken/{terminal,stream}.py` (the folder of
+   the market the venue natively serves; a new market is a new folder with its
+   own `__init__.py`): a `Protocol` for
    the slice of the SDK or socket you use, so tests can fake it (see
    `Mt5Terminal`, `KlineStream`).
-4. **DTO** — `gateways/kraken/dto.py`: a model for the raw payload that
-   implements `to_bar(timeframe) -> Bar`.
-5. **Ingestion** — `gateways/kraken/ingestion.py`:
-   - an asyncio websocket: subclass `BaseIngestion`, implement
-     `_start_source()` / `_stop_source()` (start/cancel the socket task) and
-     call `self.emit_bar(symbol, timeframe, dto.to_bar(timeframe))` for each
-     closed bar, like Binance;
+4. **DTO** — `gateways/crypto/kraken/dto.py`: a `BaseBarDTO` subclass for the
+   raw payload that implements `to_bar(timeframe) -> Bar`.
+5. **Ingestion** — `gateways/crypto/kraken/ingestion.py`:
+   - an asyncio websocket: subclass `AsyncStreamIngestion` and implement
+     `connect`, `receive`, `handle`, `disconnect`, like Binance; `handle`
+     calls `self.emit_bar(symbol, timeframe, dto.to_bar(timeframe))` for each
+     closed bar;
    - a blocking SDK: subclass `ThreadedIngestion` and implement `connect`,
      `poll`, `disconnect`, like MT5.
-   Raise `GatewayConnectionError` when the venue drops; use
+   Guard each bar with `self._is_new_bar(...)` / `self._remember_bar(...)` so
+   a replayed bar is emitted once. Raise `GatewayConnectionError` when the
+   venue drops; use
    `self._set_status(...)` for status changes — the core notifies Telegram.
 6. **Register** — one line in `providers.make_ingestion_factory()`:
    `factory.register(GatewayEnum.KRAKEN, build_kraken_ingestion)`. The builder
-   reads its settings with `context.config_as(KrakenSettings)`.
+   reads its settings with `context.config_as(KrakenSettings)` and passes the
+   shared publisher, notifier and instance id on with
+   `**context.ingestion_dependencies()`.
 7. **Enable it** — a `[kraken]` table with `enable = true` in the market file
    it belongs to, and that market in `SOURCE_MARKET`. The same builder serves
    every market that enables it.
@@ -388,10 +416,12 @@ status endpoint come for free.
 algo-trading-ingester/
 ├── ingester/
 │   ├── api/             # FastAPI routes: /health, /status
-│   ├── core/            # BaseIngestion, ThreadedIngestion, IngestionFactory, errors
-│   ├── gateways/
-│   │   ├── mt5/         # terminal adapter, DTO, bar-close business logic
-│   │   └── binance/     # websocket adapter, kline DTO, bar-close business logic
+│   ├── core/            # Base ingestions, BaseBarDTO, IngestionFactory, errors
+│   ├── gateways/        # One folder per market, one per venue inside it
+│   │   ├── forex/
+│   │   │   └── mt5/     # terminal adapter, DTO, bar-close business logic
+│   │   └── crypto/
+│   │       └── binance/ # websocket adapter, kline DTO, bar-close business logic
 │   ├── helpers/         # Telegram message templates, emoji
 │   ├── interfaces/      # Protocols: EventPublisher, Notifier, Ingestion, BarDTO
 │   ├── schemas/         # Canonical wire contract: enums, Bar, BarClosedEvent

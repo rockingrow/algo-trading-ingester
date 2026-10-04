@@ -2,8 +2,8 @@ from fastapi.testclient import TestClient
 
 from ingester.app import create_app
 from ingester.core import IngestionFactory
-from ingester.gateways.binance import BinanceIngestion
-from ingester.gateways.mt5 import Mt5Ingestion
+from ingester.gateways.crypto.binance import BinanceIngestion
+from ingester.gateways.forex.mt5 import Mt5Ingestion
 from ingester.runtime import IngesterRuntime
 from ingester.schemas import GatewayEnum, MarketEnum, Timeframe
 from ingester.settings import (
@@ -15,6 +15,7 @@ from ingester.settings import (
 )
 from tests.fakes import (
   FakeConnection,
+  FakeKlineHistory,
   FakeKlineStream,
   FakeNotifier,
   FakePublisher,
@@ -82,6 +83,7 @@ def make_runtime_factory(connection: FakeConnection, notifier: FakeNotifier):
     return BinanceIngestion(
       config=ctx.config_as(BinanceSettings),
       stream=stream,
+      history=FakeKlineHistory(),
       publisher=ctx.publisher,
       notifier=ctx.notifier,
       instance_id=ctx.settings.app.instance_id,
@@ -165,14 +167,14 @@ def test_an_unreadable_market_file_degrades_instead_of_crashing():
   # SOURCE_MARKET names a market whose TOML is missing: the markets that did
   # load still run, and the operator is told which one did not.
   connection, notifier = FakeConnection(), FakeNotifier()
-  config = make_settings(problems=["market 'cfd': config/cfd.toml is missing"])
+  config = make_settings(problems=["market 'crypto': config/crypto.toml is missing"])
   app = create_app(config, make_runtime_factory(connection, notifier))
 
   with TestClient(app) as client:
     assert len(client.get("/status").json()["gateways"]) == 2
 
   assert any("Ingester Degraded" in m for m in notifier.messages)
-  assert any("cfd.toml is missing" in m for m in notifier.messages)
+  assert any("crypto.toml is missing" in m for m in notifier.messages)
 
 
 def test_dead_nats_degrades_instead_of_crashing():
@@ -203,6 +205,7 @@ def test_a_gateway_that_will_not_start_does_not_take_the_others_down():
     return BinanceIngestion(
       config=ctx.config_as(BinanceSettings),
       stream=stream,
+      history=FakeKlineHistory(),
       publisher=ctx.publisher,
       notifier=ctx.notifier,
       instance_id=ctx.settings.app.instance_id,

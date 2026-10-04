@@ -1,5 +1,5 @@
 """
-ingester/gateways/binance/stream.py — The seam between our code and the socket.
+ingester/gateways/crypto/binance/stream.py — The seam between our code and the socket.
 
 :class:`KlineStream` is the slice of a websocket the Binance gateway needs:
 open a combined stream, read one JSON frame, close. :class:`WebsocketKlineStream`

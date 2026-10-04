@@ -1,4 +1,4 @@
-.PHONY: help install install-dev update lock fix format lint check test run
+.PHONY: help install install-dev update lock fix format lint check test run start forex crypto
 
 help:
 	@echo "Available commands:"
@@ -11,6 +11,8 @@ help:
 	@echo "  make lint          - ruff check"
 	@echo "  make test          - Run the pytest suite"
 	@echo "  make run           - Run the ingester (reads .env)"
+	@echo "  make forex         - Create config/forex.toml from its example, comments stripped (keeps an existing file)"
+	@echo "  make crypto        - Create config/crypto.toml from its example, comments stripped (keeps an existing file)"
 
 install:
 	uv sync --no-dev
@@ -40,5 +42,21 @@ check: lint
 test:
 	uv run pytest
 
-start:
+run:
 	uv run python -m ingester
+
+# Kept as an alias of run.
+start: run
+
+# Never overwrite: config/<market>.toml is the operator's own, git-ignored file.
+# The rule has no prerequisite, so make only runs it when the file is missing.
+# The copy keeps the template's header block (up to its first blank line) and
+# drops every comment-only and blank line after it, so the operator's file is
+# just the tables and their values. Done through Python so it works under
+# cmd.exe as well as sh, and creates nothing when the template is not there.
+forex: config/forex.toml
+crypto: config/crypto.toml
+
+config/%.toml:
+	@uv run python -c "L=open('config/$*.example.toml',encoding='utf-8').read().splitlines();i=L.index('');open('$@','w',encoding='utf-8').write('\n'.join(L[:i+1]+[x for x in L[i+1:] if x.strip() and not x.lstrip().startswith('#')])+'\n')"
+	@echo Created $@

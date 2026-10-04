@@ -1,5 +1,5 @@
 """
-ingester/gateways/mt5/dto.py — MT5 rate record → canonical :class:`Bar`.
+ingester/gateways/forex/mt5/dto.py — MT5 rate record → canonical :class:`Bar`.
 
 The one place that knows what an MT5 bar looks like. ``copy_rates_*`` returns
 records with these fields:
@@ -7,7 +7,7 @@ records with these fields:
 =============  =====================================================
 ``time``       bar **open** time, seconds since epoch in *server* time
 ``open`` …     OHLC prices
-``tick_volume``  ticks in the bar (the only volume forex/CFD has)
+``tick_volume``  ticks in the bar (the only volume forex has)
 ``spread``     spread in points
 ``real_volume``  exchange volume (0 unless the symbol is exchange-traded)
 =============  =====================================================
@@ -23,9 +23,10 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
-from ingester.gateways.mt5.terminal import RateRecord
+from ingester.core.dto import BaseBarDTO
+from ingester.gateways.forex.mt5.terminal import RateRecord
 from ingester.schemas.enums import Timeframe
 from ingester.schemas.market_event_schema import Bar
 
@@ -43,10 +44,8 @@ def server_time_to_utc(server_epoch: int, server_timezone: str) -> datetime:
   return wall_clock.replace(tzinfo=_zone(server_timezone)).astimezone(UTC)
 
 
-class Mt5RateDTO(BaseModel):
+class Mt5RateDTO(BaseBarDTO):
   """One validated MT5 rate record, plus the zone its clock is in."""
-
-  model_config = ConfigDict(frozen=True, extra="ignore", allow_inf_nan=False)
 
   time: int = Field(ge=0)
   open: float
@@ -72,7 +71,7 @@ class Mt5RateDTO(BaseModel):
       low=self.low,
       close=self.close,
       # Exchange volume when the symbol has one, else ticks — the only
-      # activity measure a forex/CFD bar carries.
+      # activity measure a forex bar carries.
       volume=float(self.real_volume or self.tick_volume),
       tick_count=self.tick_volume,
       spread=float(self.spread),

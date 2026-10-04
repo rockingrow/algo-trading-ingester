@@ -8,8 +8,8 @@ and the only place a new gateway has to be registered.
 from __future__ import annotations
 
 from ingester.core.factory import IngestionFactory
-from ingester.gateways.binance import build_binance_ingestion
-from ingester.gateways.mt5 import build_mt5_ingestion
+from ingester.gateways.crypto.binance import build_binance_ingestion
+from ingester.gateways.forex.mt5 import build_mt5_ingestion
 from ingester.runtime import IngesterRuntime
 from ingester.schemas.enums import GatewayEnum
 from ingester.services.nats_service import NatsConnection, NatsPublisher

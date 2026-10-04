@@ -87,6 +87,52 @@ def kline(
   return {"stream": f"{symbol.lower()}@kline_{interval}", "data": event}
 
 
+def rest_kline(
+  open_time_ms: int, *, price: float = 100.0, interval_ms: int = 60_000
+) -> list:
+  """One row of Binance's REST klines response — positional, prices as strings.
+
+  ``close_time`` is the bar's last millisecond, as Binance reports it.
+  """
+  return [
+    open_time_ms,
+    f"{price}",
+    f"{price + 1}",
+    f"{price - 1}",
+    f"{price + 0.5}",
+    "1.5",
+    open_time_ms + interval_ms - 1,
+    "150.0",
+    42,
+    "0",
+    "0",
+    "0",
+  ]
+
+
+class FakeKlineHistory:
+  """Scriptable stand-in for Binance's REST klines endpoint.
+
+  Rows are scripted per ``(symbol, interval)``; an unscripted stream answers
+  with none, and :attr:`error` is raised instead of answering at all.
+  """
+
+  def __init__(self, rows: dict[tuple[str, str], list] | None = None) -> None:
+    self.rows: dict[tuple[str, str], list] = dict(rows or {})
+    self.calls: list[tuple[str, str, int]] = []
+    #: Raised by every :meth:`klines` call while it is set.
+    self.error: Exception | None = None
+
+  def set_rows(self, symbol: str, interval: str, rows: list) -> None:
+    self.rows[(symbol, interval)] = list(rows)
+
+  async def klines(self, *, symbol: str, interval: str, limit: int) -> list:
+    self.calls.append((symbol, interval, limit))
+    if self.error is not None:
+      raise self.error
+    return list(self.rows.get((symbol, interval), []))[-limit:]
+
+
 class FakeKlineStream:
   """Scriptable stand-in for a Binance websocket.
 

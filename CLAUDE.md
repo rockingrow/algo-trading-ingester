@@ -26,10 +26,10 @@ Use plan mode, and confirm the approach, before editing:
 
 - `ingester/schemas/` — the wire contract `qte-ingest` decodes; a change here
   is a change for a consumer this repository cannot see.
-- `ingester/gateways/mt5/{ingestion,dto}.py` — bar-close detection and the
+- `ingester/gateways/forex/mt5/{ingestion,dto}.py` — bar-close detection and the
   server-time → UTC conversion; a mistake here silently drops, duplicates or
   time-shifts the bars strategies trade on.
-- `ingester/gateways/binance/{ingestion,dto}.py` — the same risk on the crypto
+- `ingester/gateways/crypto/binance/{ingestion,dto}.py` — the same risk on the crypto
   side: the `k.x` close flag, the per-stream de-duplication and the
   millisecond → UTC conversion.
 - `ingester/core/ingestion.py` — every gateway inherits it, and it owns the

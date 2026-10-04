@@ -66,6 +66,7 @@ FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
 cp .env.example .env                              # process settings, secrets
 cp config/forex.example.toml config/forex.toml    # what the forex market ingests
 cp config/crypto.example.toml config/crypto.toml  # … and the crypto market
+# or: make forex / make crypto — the same copy, never over an existing file
 
 make install-dev    # uv sync (dev group: ruff, pytest, pytest-asyncio)
 make lint / format  # ruff check . / ruff format .   (make fix = both, with --fix)
@@ -100,16 +101,19 @@ package; never scan from the repository root.
 | --- | --- |
 | Canonical wire contract (`Bar`, `BarClosedEvent`, `event_id`, subjects) | `ingester/schemas/market_event_schema.py` |
 | Shared enums (`Timeframe`, `GatewayEnum`, `MarketEnum`, statuses) | `ingester/schemas/enums.py` |
-| Ingestion lifecycle, hand-off queue, dispatcher, status + notifications | `ingester/core/ingestion.py` (`BaseIngestion`, `ThreadedIngestion`) |
+| Ingestion lifecycle, hand-off queue, dispatcher, status + notifications | `ingester/core/ingestion.py` (`BaseIngestion`, `ThreadedIngestion`, `AsyncStreamIngestion`) |
+| Per-stream de-duplication shared by every gateway | `BaseIngestion._is_new_bar` / `_remember_bar` in `ingester/core/ingestion.py` |
+| Base class of every gateway DTO | `ingester/core/dto.py` (`BaseBarDTO`) |
 | Gateway registry / factory | `ingester/core/factory.py`, registration in `ingester/providers.py` |
 | Which markets and gateways run | `SOURCE_MARKET` in `.env` → `config/<market>.toml`, loaded by `settings.load_market` |
 | Interfaces (publisher, notifier, ingestion, DTO) | `ingester/interfaces/` |
-| MT5 bar-close detection (business logic) | `ingester/gateways/mt5/ingestion.py` |
-| Binance bar-close detection (business logic) | `ingester/gateways/binance/ingestion.py` |
-| Binance kline → canonical `Bar`, interval mapping | `ingester/gateways/binance/dto.py` |
-| Binance websocket adapter | `ingester/gateways/binance/stream.py` |
-| MT5 rate → canonical `Bar`, server time → UTC | `ingester/gateways/mt5/dto.py` |
-| MetaTrader5 package adapter | `ingester/gateways/mt5/terminal.py` |
+| MT5 bar-close detection (business logic) | `ingester/gateways/forex/mt5/ingestion.py` |
+| Binance bar-close detection (business logic) | `ingester/gateways/crypto/binance/ingestion.py` |
+| Binance kline → canonical `Bar`, interval mapping | `ingester/gateways/crypto/binance/dto.py` |
+| Binance websocket adapter | `ingester/gateways/crypto/binance/stream.py` |
+| Binance REST klines adapter (`backfill_on_start`) | `ingester/gateways/crypto/binance/history.py` |
+| MT5 rate → canonical `Bar`, server time → UTC | `ingester/gateways/forex/mt5/dto.py` |
+| MetaTrader5 package adapter | `ingester/gateways/forex/mt5/terminal.py` |
 | NATS connection and one-way publisher | `ingester/services/nats_service.py` |
 | Telegram notifier, queue decorator | `ingester/services/notification_service.py` |
 | Telegram message templates, emoji | `ingester/helpers/{messages,emoji_constants}.py` |
@@ -125,8 +129,14 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
 
 - **Gateways own business logic only.** A gateway never imports NATS or
   Telegram; the core never imports a venue SDK. A new venue is a
-  `GatewaySettings` subclass, a DTO, an ingestion class and one `register` line
-  in `providers.py` — nothing else changes.
+  `GatewaySettings` subclass, a DTO (`BaseBarDTO`), an ingestion class
+  (`ThreadedIngestion` for a blocking SDK, `AsyncStreamIngestion` for an
+  asyncio feed) and one `register` line in `providers.py` — nothing else
+  changes.
+- **Venues are grouped by market on disk**: `ingester/gateways/<market>/<venue>/`
+  (`forex/mt5`, `crypto/binance`). A new venue goes under the market it
+  natively serves; a new market is a new folder. The folder is a grouping only
+  and never decides the market a running gateway reports.
 - **One canonical schema, no per-venue branching downstream.** The DTO is the
   only place that knows a venue's payload shape; past `to_bar()` everything
   speaks `Bar` / `BarClosedEvent`.

@@ -1,6 +1,6 @@
 import pytest
 
-from ingester.gateways.mt5 import Mt5Ingestion
+from ingester.gateways.forex.mt5 import Mt5Ingestion
 from ingester.schemas import BarClosedEvent, GatewayStatusEnum, Timeframe
 from ingester.settings import Mt5Settings
 from tests.fakes import FakeNotifier, FakePublisher, FakeTerminal, rate, wait_for
@@ -40,7 +40,7 @@ async def test_first_read_primes_without_publishing(terminal):
   ingestion, publisher, _ = make_ingestion(terminal)
   await ingestion.start()
   await wait_for(lambda: ingestion.status is GatewayStatusEnum.RUNNING)
-  await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
   await ingestion.stop()
   assert publisher.events == []
 
@@ -48,7 +48,7 @@ async def test_first_read_primes_without_publishing(terminal):
 async def test_new_closed_bar_is_published_once(terminal):
   ingestion, publisher, _ = make_ingestion(terminal)
   await ingestion.start()
-  await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
 
   terminal.set_rates("XAUUSD", M1, [rate(T0 - 60), rate(T0), rate(T0 + 60, 2.0)])
   await wait_for(lambda: len(publisher.events) == 1)
@@ -68,7 +68,7 @@ async def test_new_closed_bar_is_published_once(terminal):
 async def test_missed_bars_are_caught_up_in_order(terminal):
   ingestion, publisher, _ = make_ingestion(terminal)
   await ingestion.start()
-  await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
 
   terminal.set_rates(
     "XAUUSD", M1, [rate(T0), rate(T0 + 60), rate(T0 + 120), rate(T0 + 180)]
@@ -82,7 +82,7 @@ async def test_missed_bars_are_caught_up_in_order(terminal):
 async def test_disconnect_then_reconnect_notifies_and_resumes(terminal):
   ingestion, publisher, notifier = make_ingestion(terminal)
   await ingestion.start()
-  await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
 
   terminal.connected = False
   await wait_for(lambda: ingestion.status is GatewayStatusEnum.DISCONNECTED)
@@ -117,7 +117,7 @@ async def test_initialize_failure_keeps_retrying(terminal):
 async def test_unknown_symbol_is_skipped_not_fatal(terminal):
   ingestion, publisher, _ = make_ingestion(terminal, SYMBOLS=["NOPE", "XAUUSD"])
   await ingestion.start()
-  await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
   # Status crosses from the watcher thread via call_soon_threadsafe, so it may
   # land a moment after the stream is primed.
   await wait_for(lambda: ingestion.status is GatewayStatusEnum.RUNNING)
@@ -137,7 +137,7 @@ async def test_configured_base_resolves_to_the_broker_symbol():
   terminal.set_rates("XAUUSDm", M1, [rate(T0 - 60), rate(T0)])
   ingestion, publisher, _ = make_ingestion(terminal, SYMBOLS=["XAUUSD"])
   await ingestion.start()
-  await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
 
   terminal.set_rates("XAUUSDm", M1, [rate(T0), rate(T0 + 60)])
   await wait_for(lambda: len(publisher.events) == 1)
@@ -157,7 +157,7 @@ async def test_configured_suffix_breaks_ambiguity():
   terminal.set_rates("EURUSDc", M1, [rate(T0)])
   ingestion, _, _ = make_ingestion(terminal, SYMBOLS=["EURUSD"], SYMBOL_SUFFIX="c")
   await ingestion.start()
-  await wait_for(lambda: ("EURUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("EURUSD", M1) in ingestion._open_marks)
   await ingestion.stop()
   assert ingestion._broker_symbol == {"EURUSD": "EURUSDc"}
 
@@ -166,7 +166,7 @@ async def test_unresolvable_symbol_is_skipped_and_the_rest_still_run(terminal):
   terminal.catalogue = ["XAUUSD"]
   ingestion, _, _ = make_ingestion(terminal, SYMBOLS=["NOPE", "XAUUSD"])
   await ingestion.start()
-  await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
   await ingestion.stop()
   assert ingestion._broker_symbol == {"XAUUSD": "XAUUSD"}
 
@@ -186,7 +186,7 @@ async def test_backfill_publishes_the_startup_window(terminal):
 async def test_backfill_off_still_primes_silently(terminal):
   ingestion, publisher, _ = make_ingestion(terminal, BACKFILL_ON_START=False)
   await ingestion.start()
-  await wait_for(lambda: ("XAUUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
   await ingestion.stop()
   assert publisher.events == []
 
@@ -199,7 +199,7 @@ async def test_a_broken_stream_does_not_starve_the_others(terminal):
   terminal.set_rates("EURUSD", M1, [rate(T0 - 60), rate(T0)])
   ingestion, publisher, _ = make_ingestion(terminal, SYMBOLS=["XAUUSD", "EURUSD"])
   await ingestion.start()
-  await wait_for(lambda: ("EURUSD", M1) in ingestion._last_open)
+  await wait_for(lambda: ("EURUSD", M1) in ingestion._open_marks)
 
   terminal.set_rates("XAUUSD", M1, [rate(T0), broken])
   terminal.set_rates("EURUSD", M1, [rate(T0), rate(T0 + 60)])

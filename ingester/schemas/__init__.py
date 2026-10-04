@@ -7,7 +7,6 @@ from ingester.schemas.enums import (
   Timeframe,
 )
 from ingester.schemas.market_event_schema import (
-  SCHEMA_VERSION,
   Bar,
   BarClosedEvent,
   EventSource,
@@ -16,7 +15,6 @@ from ingester.schemas.market_event_schema import (
 )
 
 __all__ = [
-  "SCHEMA_VERSION",
   "Bar",
   "BarClosedEvent",
   "EventSource",

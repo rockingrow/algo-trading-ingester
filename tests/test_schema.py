@@ -4,7 +4,6 @@ import pytest
 from pydantic import ValidationError
 
 from ingester.schemas import (
-  SCHEMA_VERSION,
   Bar,
   BarClosedEvent,
   EventSource,
@@ -12,6 +11,7 @@ from ingester.schemas import (
   MarketEnum,
   Timeframe,
 )
+from ingester.settings import settings
 
 OPEN = datetime(2026, 9, 28, 10, 0, tzinfo=UTC)
 
@@ -68,7 +68,7 @@ def test_bar_closed_event_id_is_deterministic():
     source=SOURCE, symbol="XAUUSD", timeframe=Timeframe.M15, bar=make_bar()
   )
   assert one.event_id == two.event_id == f"mt5:XAUUSD:M15:{int(OPEN.timestamp())}"
-  assert one.schema_version == SCHEMA_VERSION
+  assert one.schema_version == settings.contract.VERSION
 
 
 def test_subject_tokens_sanitise_symbol_but_payload_keeps_it():

@@ -16,7 +16,12 @@ differs. The core owns the shared part, the gateway supplies the rest
 * :class:`BaseIngestion` — lifecycle, the thread-safe hand-off queue, the
   dispatcher that publishes canonical events, status tracking and operator
   notifications. Subclasses implement ``_start_source`` / ``_stop_source``.
-  An asyncio-native venue (the Binance websocket) subclasses this directly.
+  It also keeps the per-stream record of the newest bar already emitted, so
+  every gateway de-duplicates the same way.
+* :class:`AsyncStreamIngestion` — for venues that push frames over an asyncio
+  connection (the Binance websocket). Runs one task with a connect → receive →
+  reconnect loop. Subclasses implement ``connect``, ``receive``, ``handle`` and
+  ``disconnect``.
 * :class:`ThreadedIngestion` — for venues whose SDK is blocking (MetaTrader 5).
   Runs one dedicated thread with a connect → poll → reconnect loop. Subclasses
   implement only ``connect``, ``poll`` and ``disconnect``.
@@ -49,6 +54,9 @@ from ingester.schemas.market_event_schema import (
 from ingester.settings import GatewaySettings
 
 log = get_logger(__name__)
+
+#: One stream of bars: a configured symbol on one timeframe.
+StreamKey = tuple[str, Timeframe]
 
 #: Statuses in which the source is live and ``start`` must not run again.
 _ACTIVE = frozenset(
@@ -99,6 +107,10 @@ class BaseIngestion(ABC):
     self._last_published_at: datetime | None = None
     self._last_error: str | None = None
     self._last_bar: dict[str, str] = {}
+    #: Open time of the newest bar already emitted, per stream, in the venue's
+    #: own integer clock (MT5: server-clock seconds, Binance: milliseconds).
+    #: Kept across reconnects, so a replayed or re-read bar is recognised.
+    self._open_marks: dict[StreamKey, int] = {}
 
   # ── Public API ────────────────────────────────────────────────────
 
@@ -186,6 +198,26 @@ class BaseIngestion(ABC):
     """Record the venue-side origin (e.g. the MT5 trade server) on events."""
     if venue and venue != self._source.venue:
       self._source = self._source.model_copy(update={"venue": venue})
+
+  def _open_mark(self, symbol: str, timeframe: Timeframe) -> int | None:
+    """Open time of the newest bar remembered for a stream, ``None`` before the
+    first one."""
+    return self._open_marks.get((symbol, timeframe))
+
+  def _is_new_bar(self, symbol: str, timeframe: Timeframe, open_mark: int) -> bool:
+    """Whether a bar opening at *open_mark* is later than every bar this
+    stream has already emitted.
+
+    Together with :meth:`_remember_bar` this is the one de-duplication rule
+    every gateway shares. Both are called from the gateway's own source — its
+    thread or its task — never from two places at once.
+    """
+    last = self._open_marks.get((symbol, timeframe))
+    return last is None or open_mark > last
+
+  def _remember_bar(self, symbol: str, timeframe: Timeframe, open_mark: int) -> None:
+    """Record *open_mark* as the newest bar handled for a stream."""
+    self._open_marks[(symbol, timeframe)] = open_mark
 
   def emit_bar(self, symbol: str, timeframe: Timeframe, bar: Bar) -> None:
     """Hand one closed bar to the publish pipeline. Safe from any thread."""
@@ -285,6 +317,119 @@ class BaseIngestion(ABC):
   async def _flush_background(self) -> None:
     if self._background:
       await asyncio.gather(*self._background, return_exceptions=True)
+
+
+class AsyncStreamIngestion(BaseIngestion):
+  """Runs an asyncio-native venue feed on one task.
+
+  The task owns the whole venue session: ``connect``, every ``receive`` and
+  ``disconnect`` are awaited on it, and it dials again every
+  ``reconnect_interval`` seconds after the session drops. Subclasses implement
+  the four hooks and call :meth:`emit_bar` from ``handle``.
+  """
+
+  def __init__(self, *, reconnect_interval: float, **kwargs: Any) -> None:
+    super().__init__(**kwargs)
+    self._reconnect_interval = reconnect_interval
+    self._task: asyncio.Task[None] | None = None
+
+  # ── Hooks: the gateway's business logic ───────────────────────────
+
+  @abstractmethod
+  async def connect(self) -> None:
+    """Open the venue session. Raise ``GatewayConnectionError`` on failure."""
+
+  @abstractmethod
+  async def receive(self) -> Any:
+    """Next frame from the venue.
+
+    Raise ``GatewayConnectionError`` when the session is gone or went quiet.
+    """
+
+  @abstractmethod
+  def handle(self, frame: Any) -> None:
+    """``emit_bar`` the closed bar a frame carries, if it carries one.
+
+    Raise ``GatewayConnectionError`` when the frame says the session itself is
+    broken; any other exception rejects this frame only.
+    """
+
+  @abstractmethod
+  async def disconnect(self) -> None:
+    """Close the venue session. Must be safe to call when not connected."""
+
+  # ── BaseIngestion ─────────────────────────────────────────────────
+
+  async def _start_source(self) -> None:
+    self._task = asyncio.create_task(
+      self._run(), name=f"{self.gateway.value}-ingestion"
+    )
+
+  async def _stop_source(self) -> None:
+    task, self._task = self._task, None
+    if task is not None:
+      task.cancel()
+      try:
+        await task
+      except asyncio.CancelledError:
+        pass
+    # Closed here rather than in the task: a session closed while the task is
+    # being cancelled can have its own close cancelled out from under it.
+    await self.disconnect()
+
+  # ── Task body: connect → consume → reconnect ──────────────────────
+
+  async def _run(self) -> None:
+    while True:
+      try:
+        await self.connect()
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        log.warning("%s connect failed: %s", self.gateway.value, exc)
+        self._set_status(GatewayStatusEnum.DISCONNECTED, str(exc))
+        await self.disconnect()
+        await asyncio.sleep(self._reconnect_interval)
+        continue
+
+      try:
+        await self._consume()
+      except asyncio.CancelledError:
+        raise
+      except GatewayConnectionError as exc:
+        log.warning("%s connection lost: %s", self.gateway.value, exc)
+        self._set_status(GatewayStatusEnum.DISCONNECTED, str(exc))
+      except Exception as exc:
+        # A bug in the read loop must not end the feed; reconnect and carry on.
+        log.exception("%s stream failed", self.gateway.value)
+        self._set_status(GatewayStatusEnum.DISCONNECTED, f"{type(exc).__name__}: {exc}")
+      await self.disconnect()
+      await asyncio.sleep(self._reconnect_interval)
+
+  async def _consume(self) -> None:
+    """Read frames until the session drops.
+
+    The gateway counts as RUNNING on the first frame, not on the handshake: a
+    session the venue accepts and drops at once — a rate limit, say — would
+    otherwise flap RUNNING → DISCONNECTED on every reconnect and fill the
+    status chat with it.
+    """
+    live = False
+    while True:
+      frame = await self.receive()
+      if not live:
+        live = True
+        self._set_status(GatewayStatusEnum.RUNNING)
+      try:
+        self.handle(frame)
+      except (asyncio.CancelledError, GatewayConnectionError):
+        # The venue rejecting the session is the connection's problem, not
+        # this frame's — it belongs to the reconnect loop.
+        raise
+      except Exception:
+        # One malformed frame must not cost the connection; the next one is
+        # read as usual.
+        log.exception("%s frame rejected: %s", self.gateway.value, frame)
 
 
 class ThreadedIngestion(BaseIngestion):

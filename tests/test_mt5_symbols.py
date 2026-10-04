@@ -1,7 +1,7 @@
 import pytest
 
 from ingester.core.errors import SymbolResolutionError
-from ingester.gateways.mt5.symbols import resolve_symbol
+from ingester.gateways.forex.mt5.symbols import resolve_symbol
 
 # A slice of an Exness catalogue: the metal carries an "m", oil does not exist
 # unsuffixed, and EURUSD is offered in two account flavours.

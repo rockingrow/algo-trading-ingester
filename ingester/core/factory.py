@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import TypedDict, TypeVar
 
 from ingester.core.errors import GatewayNotRegisteredError
 from ingester.interfaces.ingestion_protocol import Ingestion
@@ -25,6 +25,18 @@ from ingester.schemas.enums import GatewayEnum
 from ingester.settings import GatewaySettings, Settings
 
 ConfigT = TypeVar("ConfigT", bound=GatewaySettings)
+
+
+class IngestionDependencies(TypedDict):
+  """What every ``BaseIngestion`` takes besides its own config and venue seam.
+
+  Typed, so a builder spreading it into a constructor is still checked against
+  that constructor's keyword arguments.
+  """
+
+  publisher: EventPublisher
+  notifier: Notifier
+  instance_id: str
 
 
 @dataclass(frozen=True)
@@ -53,6 +65,19 @@ class IngestionContext:
         f"{type(self.gateway_config).__name__}"
       )
     return self.gateway_config
+
+  def ingestion_dependencies(self) -> IngestionDependencies:
+    """The constructor arguments every ``BaseIngestion`` takes besides its own
+    config and venue seam.
+
+    Builders spread this instead of each repeating the same three lines, so a
+    dependency the core gains later reaches every gateway from one place.
+    """
+    return {
+      "publisher": self.publisher,
+      "notifier": self.notifier,
+      "instance_id": self.settings.app.instance_id,
+    }
 
 
 IngestionBuilder = Callable[[IngestionContext], Ingestion]

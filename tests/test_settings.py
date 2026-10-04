@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from ingester.schemas import GatewayEnum, MarketEnum, Timeframe
 from ingester.settings import (
@@ -28,6 +29,8 @@ CRYPTO_TOML = """
 enable = true
 symbols = ["BTCUSDT"]
 timeframes = ["H1"]
+catchup_bars = 16
+backfill_on_start = true
 """
 
 
@@ -68,6 +71,30 @@ def test_nats_url(monkeypatch):
   assert NatsSettings(_env_file=None).url == "nats://nats.internal:4333"
 
 
+def test_stream_name_is_derived_from_the_subject_prefix(monkeypatch):
+  monkeypatch.setenv("NATS_SUBJECT_PREFIX", "INGEST")
+  assert NatsSettings(_env_file=None).stream_name == "INGEST"
+
+
+def test_stream_name_keeps_only_the_prefix_first_token(monkeypatch):
+  # A stream name cannot hold a dot, so a multi-token prefix is truncated
+  # rather than rejected by the server on the first publish.
+  monkeypatch.setenv("NATS_SUBJECT_PREFIX", "INGEST.prod")
+  assert NatsSettings(_env_file=None).stream_name == "INGEST"
+
+
+def test_stream_name_replaces_characters_a_stream_cannot_hold(monkeypatch):
+  monkeypatch.setenv("NATS_SUBJECT_PREFIX", "my/prefix")
+  assert NatsSettings(_env_file=None).stream_name == "my_prefix"
+
+
+def test_stream_name_ignores_a_leftover_stream_name_variable(monkeypatch):
+  # The setting is gone; an old .env line must not resurrect it.
+  monkeypatch.setenv("NATS_SUBJECT_PREFIX", "INGEST")
+  monkeypatch.setenv("NATS_STREAM_NAME", "STALE")
+  assert NatsSettings(_env_file=None).stream_name == "INGEST"
+
+
 def test_source_market_is_a_csv_list(monkeypatch):
   monkeypatch.setenv("SOURCE_MARKET", "FOREX, crypto ,,forex")
   config = SourceSettings(_env_file=None)
@@ -101,6 +128,20 @@ def test_crypto_file_yields_binance_settings(tmp_path):
   assert config.MARKET is MarketEnum.CRYPTO
   assert config.SYMBOLS == ["BTCUSDT"]
   assert config.TIMEFRAMES == [Timeframe.H1]
+  assert config.CATCHUP_BARS == 16
+  assert config.BACKFILL_ON_START is True
+
+
+def test_binance_catchup_bars_is_bounded_by_the_venue_limit(tmp_path):
+  # Binance refuses a limit above 1000, so a table asking for more is refused
+  # at start-up rather than on the first request.
+  write(
+    tmp_path,
+    "crypto.toml",
+    "[binance]\nenable = true\ncatchup_bars = 1001\n",
+  )
+  with pytest.raises(MarketConfigError, match="invalid"):
+    load_market(MarketEnum.CRYPTO, tmp_path)
 
 
 def test_env_fills_what_the_table_leaves_out(tmp_path, monkeypatch):
@@ -219,17 +260,24 @@ def test_one_gateway_cannot_run_in_two_markets(tmp_path):
   # would shut the first one's terminal down — and both would publish the same
   # event_id, which carries no market.
   write(tmp_path, "forex.toml", FOREX_TOML)
-  write(tmp_path, "cfd.toml", FOREX_TOML)
-  loaded, problems = load_markets([MarketEnum.FOREX, MarketEnum.CFD], tmp_path)
+  write(tmp_path, "crypto.toml", FOREX_TOML)
+  loaded, problems = load_markets([MarketEnum.FOREX, MarketEnum.CRYPTO], tmp_path)
 
   assert list(loaded[MarketEnum.FOREX].gateways) == [GatewayEnum.MT5]
-  assert loaded[MarketEnum.CFD].gateways == {}
+  assert loaded[MarketEnum.CRYPTO].gateways == {}
   assert len(problems) == 1
-  assert "enabled in both 'forex' and 'cfd'" in problems[0]
+  assert "enabled in both 'forex' and 'crypto'" in problems[0]
 
 
 def test_a_missing_market_without_a_template_says_create_it(tmp_path):
-  # cfd is a valid SOURCE_MARKET value but ships no template; the error must
-  # not point at a file that does not exist.
+  # No template sits next to the missing file here; the error must not point
+  # at one that does not exist.
   with pytest.raises(MarketConfigError, match="create"):
-    load_market(MarketEnum.CFD, tmp_path)
+    load_market(MarketEnum.CRYPTO, tmp_path)
+
+
+def test_cfd_is_not_a_market():
+  # Only the markets with a gateway behind them are accepted.
+  with pytest.raises(ValidationError):
+    SourceSettings(_env_file=None, MARKET="forex,cfd")
+  assert {market.value for market in MarketEnum} == {"forex", "crypto"}

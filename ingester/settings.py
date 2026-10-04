@@ -26,6 +26,7 @@ markets and gateways, host/port and every NATS/Telegram knob are configuration.
 
 from __future__ import annotations
 
+import re
 import socket
 import tomllib
 from dataclasses import dataclass, field
@@ -36,6 +37,10 @@ from pydantic import Field, SkipValidation, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from ingester.schemas.enums import GatewayEnum, MarketEnum, Timeframe
+
+#: A NATS stream name cannot hold a dot, space, wildcard or slash; a derived
+#: name keeps only what is always safe and replaces the rest.
+_STREAM_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 def _config(prefix: str) -> SettingsConfigDict:
@@ -110,6 +115,16 @@ class SourceSettings(BaseSettings):
     return [str(item).lower() for item in split_csv(value)]
 
 
+class ContractSettings(BaseSettings):
+  """Version stamped on every published payload (env prefix ``SCHEMA_``)."""
+
+  model_config = _config("SCHEMA_")
+
+  #: Bump on any breaking change to the payload shape. Subscribers should reject
+  #: (or route aside) a major version they do not understand.
+  VERSION: str = "1.0.0"
+
+
 class LoggingSettings(BaseSettings):
   """Application logging (env prefix ``LOG_``)."""
 
@@ -134,7 +149,6 @@ class NatsSettings(BaseSettings):
   #: Core NATS publish is fire-and-forget; JetStream persists each bar so a
   #: subscriber that was down can replay it, de-duplicated by ``event_id``.
   JETSTREAM_ENABLED: bool = False
-  STREAM_NAME: str = "INGEST"
   PUBLISH_TIMEOUT: float = 5.0
   #: How long the stream keeps a bar (only used when the stream is created).
   STREAM_MAX_AGE_SECONDS: float = 7 * 24 * 3600
@@ -143,6 +157,20 @@ class NatsSettings(BaseSettings):
   @property
   def url(self) -> str:
     return f"nats://{self.HOST}:{self.PORT}"
+
+  @property
+  def stream_name(self) -> str:
+    """JetStream stream name — derived from ``SUBJECT_PREFIX``, never set.
+
+    The stream has to listen on ``<SUBJECT_PREFIX>.>`` to accept what this
+    ingester publishes, and a stream is never reconfigured once it exists. A
+    separately configured name is therefore a silent outage waiting to happen:
+    change one and not the other and every publish is rejected. Deriving the
+    name removes the chance to get them out of step, at the cost of not being
+    able to version the stream independently of the subject tree. Only the
+    prefix's first token is used, because a stream name cannot hold a dot.
+    """
+    return _STREAM_NAME_UNSAFE.sub("_", self.SUBJECT_PREFIX.split(".", 1)[0])
 
 
 class TelegramSettings(BaseSettings):
@@ -268,6 +296,24 @@ class BinanceSettings(GatewaySettings):
   #: Combined-stream endpoint. ``wss://testnet.binance.vision/stream`` for the
   #: testnet; ``wss://fstream.binance.com/stream`` for USD-M futures.
   WS_URL: str = "wss://stream.binance.com:9443/stream"
+  #: Publish the closed bars the REST klines endpoint reports at start-up
+  #: instead of waiting for the websocket's first close. Recovers the bars a
+  #: crash or restart would otherwise skip, bounded by ``CATCHUP_BARS``. Safe
+  #: with JetStream, which de-duplicates on ``event_id``.
+  BACKFILL_ON_START: bool = False
+  #: Closed bars read per stream by that backfill — how long an outage it can
+  #: recover is this × the timeframe. Only used when ``BACKFILL_ON_START`` is
+  #: on: the websocket needs no catch-up window, it pushes every close. 1000
+  #: is Binance's own per-request limit.
+  CATCHUP_BARS: int = Field(default=5, ge=1, le=1000)
+  #: The full REST klines endpoint the backfill reads, because its path differs
+  #: per product: ``https://testnet.binance.vision/api/v3/klines`` for the
+  #: testnet, ``https://fapi.binance.com/fapi/v1/klines`` for USD-M futures.
+  #: Keep it on the same product as ``WS_URL`` or the two disagree about which
+  #: book the bars came from.
+  KLINES_URL: str = "https://api.binance.com/api/v3/klines"
+  #: Seconds a single backfill request may take.
+  HTTP_TIMEOUT_SECONDS: float = 10.0
   #: Seconds before a dropped socket is dialled again.
   RECONNECT_INTERVAL_SECONDS: float = 5.0
   #: Websocket keep-alive. Binance answers pings; a silent peer is dropped
@@ -318,8 +364,8 @@ def load_market(market: MarketEnum, config_dir: Path) -> MarketSettings:
       tables = tomllib.load(handle)
   except FileNotFoundError:
     example = path.with_suffix(".example.toml")
-    # Only point at a template that is actually there: not every market in
-    # ``MarketEnum`` has one committed.
+    # Only point at a template that is actually there: SOURCE_CONFIG_DIR can
+    # name a directory the committed templates were never copied to.
     hint = f"copy {example} to {path}" if example.is_file() else f"create {path}"
     raise MarketConfigError(
       f"market {market.value!r}: {path} is missing ({hint})"
@@ -426,6 +472,7 @@ class Settings(BaseSettings):
 
   app: AppSettings = Field(default_factory=AppSettings)
   source: SourceSettings = Field(default_factory=SourceSettings)
+  contract: ContractSettings = Field(default_factory=ContractSettings)
   logging: LoggingSettings = Field(default_factory=LoggingSettings)
   nats: NatsSettings = Field(default_factory=NatsSettings)
   telegram: TelegramSettings = Field(default_factory=TelegramSettings)
