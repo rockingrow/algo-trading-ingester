@@ -219,10 +219,31 @@ class BaseIngestion(ABC):
     """Record *open_mark* as the newest bar handled for a stream."""
     self._open_marks[(symbol, timeframe)] = open_mark
 
-  def emit_bar(self, symbol: str, timeframe: Timeframe, bar: Bar) -> None:
-    """Hand one closed bar to the publish pipeline. Safe from any thread."""
+  def emit_bar(
+    self,
+    symbol: str,
+    timeframe: Timeframe,
+    bar: Bar,
+    *,
+    warmup_bar: bool = False,
+    warmup_index: int | None = None,
+    warmup_total: int | None = None,
+  ) -> None:
+    """Hand one closed bar to the publish pipeline. Safe from any thread.
+
+    ``warmup_bar`` marks a bar read back at start-up rather than published as
+    it closed, so a subscriber can warm indicators on it without acting on it.
+    ``warmup_index`` / ``warmup_total`` number it inside that window — a
+    gateway passes all three or none, and the schema rejects anything between.
+    """
     event = BarClosedEvent.create(
-      source=self._source, symbol=symbol, timeframe=timeframe, bar=bar
+      source=self._source,
+      symbol=symbol,
+      timeframe=timeframe,
+      bar=bar,
+      warmup_bar=warmup_bar,
+      warmup_index=warmup_index,
+      warmup_total=warmup_total,
     )
     self._last_bar[f"{symbol}:{timeframe.value}"] = bar.open_time.isoformat()
     self._call_in_loop(self._enqueue, event)
@@ -275,6 +296,10 @@ class BaseIngestion(ABC):
     task.add_done_callback(self._background.discard)
 
   async def _dispatch_loop(self) -> None:
+    # One event at a time, in the order the gateway emitted it. A warm-up
+    # window is a numbered series the subscriber ends on
+    # ``warmup_index == warmup_total``, so publishing these concurrently would
+    # break the contract, not just reorder a log.
     assert self._queue is not None
     while True:
       event = await self._queue.get()

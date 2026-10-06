@@ -8,10 +8,10 @@
     "ingester_id": "vps-mt5-01",
     "venue": "Broker-Server-Demo"
   },
-  "emitted_at": "2026-09-28T10:15:00.412000Z",
-  "warmup_bar": false,
-  "warmup_index": null,
-  "warmup_total": null,
+  "emitted_at": "2026-09-28T10:15:02.731000Z",
+  "warmup_bar": true,
+  "warmup_index": 150,
+  "warmup_total": 150,
   "symbol": "XAUUSD",
   "timeframe": "M15",
   "bar": {

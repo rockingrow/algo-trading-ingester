@@ -13,6 +13,7 @@ from tests.fakes import (
   kline,
   rest_kline,
   wait_for,
+  warmup_series,
 )
 
 M1 = Timeframe.M1
@@ -234,7 +235,7 @@ async def test_backfill_publishes_history_then_live_bars():
   )
   stream = FakeKlineStream([kline(T0_MS + 120_000)])
   ingestion, publisher, _ = make_ingestion(
-    stream, history, BACKFILL_ON_START=True, CATCHUP_BARS=16
+    stream, history, BACKFILL_ON_START=True, WARMUP_BARS=16
   )
   await ingestion.start()
   await wait_for(lambda: len(publisher.events) == 3)
@@ -245,6 +246,14 @@ async def test_backfill_publishes_history_then_live_bars():
     T0_MS // 1000,
     (T0_MS + 60_000) // 1000,
     (T0_MS + 120_000) // 1000,
+  ]
+  # What REST handed back is the numbered warm-up window, oldest first; what
+  # the socket delivered afterwards is live. The subscriber ends its warm-up on
+  # the bar where index == total.
+  assert warmup_series(publisher) == [
+    (True, 1, 2),
+    (True, 2, 2),
+    (False, None, None),
   ]
   bar = publisher.events[0].bar
   assert (bar.open, bar.high, bar.low, bar.close) == (100.0, 101.0, 99.0, 100.5)
@@ -262,13 +271,13 @@ async def test_backfill_reads_every_stream_one_bar_past_the_window():
     SYMBOLS=["BTCUSDT", "ETHUSDT"],
     TIMEFRAMES=[M1, Timeframe.M15],
     BACKFILL_ON_START=True,
-    CATCHUP_BARS=4,
+    WARMUP_BARS=4,
   )
   await ingestion.start()
   await wait_for(lambda: len(history.calls) == 4)
   await ingestion.stop()
 
-  # limit is catchup_bars + 1: the extra row is the forming bar, dropped.
+  # limit is warmup_bars + 1: the extra row is the forming bar, dropped.
   assert history.calls == [
     ("BTCUSDT", "1m", 5),
     ("BTCUSDT", "15m", 5),
@@ -277,12 +286,70 @@ async def test_backfill_reads_every_stream_one_bar_past_the_window():
   ]
 
 
-async def test_backfill_never_exceeds_catchup_bars():
+async def test_warmup_total_is_the_window_binance_returned_not_warmup_bars():
+  # Three closed bars of history against warmup_bars = 16. A total of 16 would
+  # leave the subscriber warming up forever.
+  history = FakeKlineHistory(
+    {("BTCUSDT", "1m"): [rest_kline(T0_MS + i * 60_000) for i in range(3)]}
+  )
+  ingestion, publisher, _ = make_ingestion(
+    FakeKlineStream(), history, BACKFILL_ON_START=True, WARMUP_BARS=16
+  )
+  await ingestion.start()
+  await wait_for(lambda: len(publisher.events) == 3)
+  await ingestion.stop()
+
+  assert warmup_series(publisher) == [(True, 1, 3), (True, 2, 3), (True, 3, 3)]
+
+
+async def test_a_repeated_row_does_not_shorten_the_warmup_series():
+  # A response that repeats an open time must not leave the series one short of
+  # the warmup_total it announces.
+  history = FakeKlineHistory(
+    {
+      ("BTCUSDT", "1m"): [
+        rest_kline(T0_MS),
+        rest_kline(T0_MS),
+        rest_kline(T0_MS + 60_000),
+      ]
+    }
+  )
+  ingestion, publisher, _ = make_ingestion(
+    FakeKlineStream(), history, BACKFILL_ON_START=True, WARMUP_BARS=16
+  )
+  await ingestion.start()
+  await wait_for(lambda: len(publisher.events) == 2)
+  await ingestion.stop()
+
+  assert warmup_series(publisher) == [(True, 1, 2), (True, 2, 2)]
+
+
+async def test_a_broken_row_leaves_the_whole_warmup_window_unpublished():
+  # Same rule as MT5: a series that stops short of its own warmup_total strands
+  # a subscriber that ends its warm-up on index == total.
+  broken = rest_kline(T0_MS + 60_000)
+  broken[2] = "0"  # high below the open — the schema rejects the bar
+  history = FakeKlineHistory(
+    {("BTCUSDT", "1m"): [rest_kline(T0_MS), broken, rest_kline(T0_MS + 120_000)]}
+  )
+  stream = FakeKlineStream([kline(T0_MS + 180_000)])
+  ingestion, publisher, _ = make_ingestion(
+    stream, history, BACKFILL_ON_START=True, WARMUP_BARS=16
+  )
+  await ingestion.start()
+  # The live socket is unaffected — a REST failure must never cost it bars.
+  await wait_for(lambda: len(publisher.events) == 1)
+  await ingestion.stop()
+
+  assert warmup_series(publisher) == [(False, None, None)]
+
+
+async def test_backfill_never_exceeds_warmup_bars():
   history = FakeKlineHistory(
     {("BTCUSDT", "1m"): [rest_kline(T0_MS + i * 60_000) for i in range(6)]}
   )
   ingestion, publisher, _ = make_ingestion(
-    FakeKlineStream(), history, BACKFILL_ON_START=True, CATCHUP_BARS=2
+    FakeKlineStream(), history, BACKFILL_ON_START=True, WARMUP_BARS=2
   )
   await ingestion.start()
   await wait_for(lambda: len(publisher.events) == 2)

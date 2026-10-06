@@ -14,9 +14,13 @@ emitted.
 * **Start-up**: the first read only records the latest closed bar; nothing is
   emitted, so a restart never re-publishes history. With
   ``backfill_on_start`` it publishes that whole window instead, recovering
-  the bars a crash skipped.
-* **Catch-up**: each read fetches ``catchup_bars`` bars, so bars that closed
-  while the terminal was disconnected are still published, oldest first.
+  the bars a crash skipped — flagged ``warmup_bar`` and numbered
+  ``warmup_index`` of ``warmup_total``, oldest first, so a subscriber can warm
+  indicators on them without acting on them and knows which one ends the
+  window.
+* **Gap recovery**: each read fetches ``warmup_bars`` bars, so bars that
+  closed while the terminal was disconnected are still published, oldest
+  first. They are late rather than warm-up, so they are not flagged.
 * **Timing**: MT5 opens a new bar on its first tick, so a close is seen on the
   first tick of the next bar plus up to one ``poll_interval_seconds``.
 
@@ -36,6 +40,7 @@ from ingester.gateways.forex.mt5.symbols import resolve_symbol
 from ingester.gateways.forex.mt5.terminal import Mt5Terminal
 from ingester.logger import get_logger
 from ingester.schemas.enums import GatewayEnum, Timeframe
+from ingester.schemas.market_event_schema import Bar
 from ingester.settings import Mt5Settings
 
 log = get_logger(__name__)
@@ -56,7 +61,7 @@ class Mt5Ingestion(ThreadedIngestion):
     self._mt5_config = config
     self._terminal = terminal
     # The newest bar already emitted per stream is remembered by the core, as a
-    # server-clock epoch; it survives reconnects, so the catch-up read knows
+    # server-clock epoch; it survives reconnects, so the warm-up read knows
     # where it left off.
     # Streams currently returning no data — warned about once, not every poll.
     self._silent: set[StreamKey] = set()
@@ -152,7 +157,7 @@ class Mt5Ingestion(ThreadedIngestion):
   def _poll_stream(self, symbol: str, broker_symbol: str, timeframe: Timeframe) -> None:
     key = (symbol, timeframe)
     records = self._terminal.copy_rates_from_pos(
-      broker_symbol, timeframe, 1, self._mt5_config.CATCHUP_BARS
+      broker_symbol, timeframe, 1, self._mt5_config.WARMUP_BARS
     )
     if not records:
       if key not in self._silent:
@@ -171,10 +176,16 @@ class Mt5Ingestion(ThreadedIngestion):
 
     log.debug("MT5 raw %s %s: %s", symbol, timeframe.value, records)
 
-    rates = sorted(
-      (Mt5RateDTO.from_record(r, self._mt5_config.SERVER_TIMEZONE) for r in records),
-      key=lambda rate: rate.time,
-    )
+    # One bar per open time, oldest first. A window that repeated a bar would
+    # make the warm-up series below shorter than its own ``warmup_total``, and
+    # the subscriber waits for that number.
+    by_time = {
+      dto.time: dto
+      for dto in (
+        Mt5RateDTO.from_record(r, self._mt5_config.SERVER_TIMEZONE) for r in records
+      )
+    }
+    rates = [by_time[open_mark] for open_mark in sorted(by_time)]
 
     if self._open_mark(symbol, timeframe) is None:
       if not self._mt5_config.BACKFILL_ON_START:
@@ -191,25 +202,77 @@ class Mt5Ingestion(ThreadedIngestion):
       # bar the previous process already sent is republished — harmless,
       # because ``event_id`` is deterministic and JetStream drops it as a
       # duplicate.
-      log.info(
-        "MT5 %s %s backfilling %d closed bar(s) from %s",
-        symbol,
-        timeframe.value,
-        len(rates),
-        rates[0].to_bar(timeframe).open_time.isoformat(),
-      )
+      self._emit_warmup(symbol, timeframe, rates)
+      return
 
     for rate in rates:
       if self._is_new_bar(symbol, timeframe, rate.time):
-        bar = rate.to_bar(timeframe)
-        if log.isEnabledFor(logging.DEBUG):
-          # Guarded: model_dump_json() would otherwise run on every bar even
-          # when DEBUG is off, because arguments are evaluated before the call.
-          log.debug(
-            "MT5 %s %s DTO bar (pre-publish): %s",
-            symbol,
-            timeframe.value,
-            bar.model_dump_json(),
-          )
-        self.emit_bar(symbol, timeframe, bar)
-        self._remember_bar(symbol, timeframe, rate.time)
+        self._emit(symbol, timeframe, rate.time, rate.to_bar(timeframe))
+
+  def _emit_warmup(
+    self, symbol: str, timeframe: Timeframe, rates: list[Mt5RateDTO]
+  ) -> None:
+    """Publish the start-up window as a numbered series, oldest first.
+
+    ``warmup_total`` is the length of *this* window rather than the configured
+    ``warmup_bars``: a broker with a thinner archive hands back fewer bars, and
+    a subscriber that ends its warm-up on ``warmup_index == warmup_total``
+    would otherwise wait for a bar MT5 never had.
+
+    Called only for a stream nothing is remembered for yet, so every bar in the
+    window is new and the numbering is contiguous by construction.
+    """
+    # The whole window is converted before the first bar is published: a record
+    # the schema rejects half-way through would otherwise truncate a series
+    # that has already announced its own length, and the mark it moved means
+    # the next poll would not retry it — leaving a subscriber waiting for an
+    # index that never arrives. Raising here publishes nothing and leaves the
+    # mark untouched, so the next poll reads the window again.
+    window = [(rate.time, rate.to_bar(timeframe)) for rate in rates]
+    total = len(window)
+    log.info(
+      "MT5 %s %s backfilling %d closed bar(s) from %s",
+      symbol,
+      timeframe.value,
+      total,
+      window[0][1].open_time.isoformat(),
+    )
+    for index, (open_mark, bar) in enumerate(window, start=1):
+      self._emit(
+        symbol, timeframe, open_mark, bar, warmup_index=index, warmup_total=total
+      )
+
+  def _emit(
+    self,
+    symbol: str,
+    timeframe: Timeframe,
+    open_mark: int,
+    bar: Bar,
+    *,
+    warmup_index: int | None = None,
+    warmup_total: int | None = None,
+  ) -> None:
+    """Hand one converted bar to the pipeline, then move the stream's mark.
+
+    A numbered call is a warm-up bar and an unnumbered one is live; the two
+    cannot disagree because there is only one place that decides.
+    """
+    warmup_bar = warmup_index is not None
+    if log.isEnabledFor(logging.DEBUG):
+      # Guarded: model_dump_json() would otherwise run on every bar even when
+      # DEBUG is off, because arguments are evaluated before the call.
+      log.debug(
+        "MT5 %s %s DTO bar (pre-publish): %s",
+        symbol,
+        timeframe.value,
+        bar.model_dump_json(),
+      )
+    self.emit_bar(
+      symbol,
+      timeframe,
+      bar,
+      warmup_bar=warmup_bar,
+      warmup_index=warmup_index,
+      warmup_total=warmup_total,
+    )
+    self._remember_bar(symbol, timeframe, open_mark)

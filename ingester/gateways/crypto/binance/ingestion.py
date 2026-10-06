@@ -16,10 +16,12 @@ bars Binance marks closed.
 * **Start-up**: the socket only carries bars that close while it is connected,
   so by default the bars that closed before this process started are simply
   not published. With ``backfill_on_start`` the gateway reads the last
-  ``catchup_bars`` closed bars per stream from the REST klines endpoint once
+  ``warmup_bars`` closed bars per stream from the REST klines endpoint once
   the socket is open, and publishes those first — so a subscriber gets
   backfill and live bars as one continuous series, the bars a crash skipped
-  included.
+  included. Those carry ``warmup_bar`` and are numbered ``warmup_index`` of
+  ``warmup_total``, oldest first, so a subscriber knows which one ends the
+  window; what the socket delivers carries neither.
 * **De-duplication**: a reconnect can replay the bar that closed while the
   socket was down, and Binance occasionally repeats a final update. The core
   remembers the newest open time already emitted per stream, so each bar is
@@ -186,37 +188,68 @@ class BinanceIngestion(AsyncStreamIngestion):
       interval=interval,
       # One more than asked for: Binance's newest row is the bar still
       # forming, and publishing it would hand strategies an unfinished candle.
-      limit=self._binance_config.CATCHUP_BARS + 1,
+      limit=self._binance_config.WARMUP_BARS + 1,
     )
     now_ms = int(utcnow().timestamp() * 1000)
-    klines = sorted(
-      (
+    # One kline per open time, oldest first. A response that repeated a bar
+    # would make the series below shorter than its own ``warmup_total``, and
+    # the subscriber waits for that number.
+    by_open = {
+      dto.open_time_ms: dto
+      for dto in (
         BinanceKlineDTO.from_rest_row(
           row, symbol=symbol, interval=interval, now_ms=now_ms
         )
         for row in rows
-      ),
-      key=lambda kline: kline.open_time_ms,
-    )
+      )
+    }
+    klines = [by_open[open_ms] for open_ms in sorted(by_open)]
     closed = [kline for kline in klines if kline.is_closed]
-    if not closed:
-      log.info("Binance %s %s has no closed bar to backfill", symbol, timeframe.value)
-      return
     # Trimmed from the newest end: a venue that hands back more rows than asked
     # must not widen the window the operator configured.
-    closed = closed[-self._binance_config.CATCHUP_BARS :]
+    closed = closed[-self._binance_config.WARMUP_BARS :]
+    # Filtered before the window is numbered, not inside the emit loop: a bar
+    # dropped halfway would leave a gap in ``warmup_index``. Nothing can be
+    # dropped today — ``_backfill`` only visits streams with no mark yet — and
+    # doing it here keeps that true however the caller changes.
+    window = [
+      kline
+      for kline in closed
+      if self._is_new_bar(symbol, timeframe, kline.open_time_ms)
+    ]
+    if not window:
+      log.info("Binance %s %s has no closed bar to backfill", symbol, timeframe.value)
+      return
+    # ``warmup_total`` is the length of *this* window rather than the configured
+    # ``warmup_bars``: a stream listed days ago has less history than that, and
+    # a subscriber that ends its warm-up on ``warmup_index == warmup_total``
+    # would otherwise wait for a bar Binance never had.
+    #
+    # Converted in full before the first bar is published, for the same reason:
+    # a row the schema rejects half-way through would truncate a series that
+    # has already announced its length, and the marks it moved mean the next
+    # reconnect would not retry it. Raising here publishes nothing and leaves
+    # the marks untouched, so ``_backfill`` logs the stream and the next
+    # reconnect reads it again.
+    bars = [(kline.open_time_ms, kline.to_bar(timeframe)) for kline in window]
+    total = len(bars)
     log.info(
       "Binance %s %s backfilling %d closed bar(s) from %s",
       symbol,
       timeframe.value,
-      len(closed),
-      closed[0].to_bar(timeframe).open_time.isoformat(),
+      total,
+      bars[0][1].open_time.isoformat(),
     )
-    for kline in closed:
-      if not self._is_new_bar(symbol, timeframe, kline.open_time_ms):
-        continue
-      self._remember_bar(symbol, timeframe, kline.open_time_ms)
-      self.emit_bar(symbol, timeframe, kline.to_bar(timeframe))
+    for index, (open_time_ms, bar) in enumerate(bars, start=1):
+      self._remember_bar(symbol, timeframe, open_time_ms)
+      self.emit_bar(
+        symbol,
+        timeframe,
+        bar,
+        warmup_bar=True,
+        warmup_index=index,
+        warmup_total=total,
+      )
 
   def _warn_once(self, key: str, message: str, *args: Any) -> None:
     if key in self._unknown:

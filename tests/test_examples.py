@@ -18,7 +18,16 @@ EXAMPLES = ROOT / "examples" / "nats"
 CONFIG = ROOT / "config"
 
 
-@pytest.mark.parametrize("name", ["bar.closed.mt5.json", "bar.closed.binance.json"])
+@pytest.mark.parametrize(
+  "name",
+  [
+    "bar.closed.mt5.json",
+    "bar.closed.binance.json",
+    # The last bar of a warm-up window: same bar and same event_id as the live
+    # sample above, which is exactly the overlap a subscriber de-duplicates.
+    "bar.closed.mt5.warmup.json",
+  ],
+)
 def test_bar_closed_example_matches_schema(name):
   raw = json.loads((EXAMPLES / name).read_text(encoding="utf-8"))
   event = BarClosedEvent.model_validate(raw)

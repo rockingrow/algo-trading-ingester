@@ -71,6 +71,72 @@ def test_bar_closed_event_id_is_deterministic():
   assert one.schema_version == settings.contract.VERSION
 
 
+def test_bar_closed_defaults_to_a_live_bar():
+  event = BarClosedEvent.create(
+    source=SOURCE, symbol="XAUUSD", timeframe=Timeframe.M15, bar=make_bar()
+  )
+  assert event.warmup_bar is False
+  assert event.warmup_index is None
+  assert event.warmup_total is None
+
+
+def make_warmup(**overrides) -> BarClosedEvent:
+  fields = dict(warmup_bar=True, warmup_index=150, warmup_total=150)
+  fields.update(overrides)
+  return BarClosedEvent.create(
+    source=SOURCE, symbol="XAUUSD", timeframe=Timeframe.M15, bar=make_bar(), **fields
+  )
+
+
+def test_warmup_fields_do_not_change_the_event_id():
+  # The same bar can arrive live from one process and as warm-up from the next —
+  # and as a different position in the next window again. JetStream
+  # de-duplicates on event_id, so none of the three may reach it.
+  live = BarClosedEvent.create(
+    source=SOURCE, symbol="XAUUSD", timeframe=Timeframe.M15, bar=make_bar()
+  )
+  last = make_warmup()
+  first = make_warmup(warmup_index=1)
+  assert last.warmup_bar is True
+  assert (last.warmup_index, last.warmup_total) == (150, 150)
+  assert last.event_id == first.event_id == live.event_id
+
+
+def test_a_warmup_bar_must_be_numbered():
+  # Half a series leaves a subscriber ending its warm-up on
+  # warmup_index == warmup_total waiting for a message that never comes.
+  with pytest.raises(ValidationError, match="both warmup_index and warmup_total"):
+    make_warmup(warmup_total=None)
+  with pytest.raises(ValidationError, match="both warmup_index and warmup_total"):
+    make_warmup(warmup_index=None)
+
+
+def test_a_live_bar_must_not_be_numbered():
+  with pytest.raises(ValidationError, match="belong to a warmup bar only"):
+    make_warmup(warmup_bar=False)
+
+
+def test_warmup_index_cannot_run_past_the_window():
+  with pytest.raises(ValidationError, match="warmup_index must be <= warmup_total"):
+    make_warmup(warmup_index=151)
+
+
+def test_warmup_index_is_one_based():
+  with pytest.raises(ValidationError, match="greater than or equal to 1"):
+    make_warmup(warmup_index=0)
+
+
+def test_the_warmup_numbers_survive_the_json_round_trip():
+  event = make_warmup(warmup_index=7, warmup_total=16)
+  decoded = BarClosedEvent.model_validate_json(event.model_dump_json())
+  assert (decoded.warmup_bar, decoded.warmup_index, decoded.warmup_total) == (
+    True,
+    7,
+    16,
+  )
+  assert decoded == event
+
+
 def test_subject_tokens_sanitise_symbol_but_payload_keeps_it():
   event = BarClosedEvent.create(
     source=SOURCE, symbol="XAUUSD.m", timeframe=Timeframe.H1, bar=make_bar()

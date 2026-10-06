@@ -31,15 +31,20 @@ ws_url = "wss://stream.binance.com:9443/stream"
 # default the bars that closed before this process started are never published.
 # true = read them back from Binance's REST klines endpoint once the socket is
 # open and publish them first, so a subscriber gets backfill + live bars as one
-# series. Turn NATS_JETSTREAM_ENABLED on with it: bars the previous process
-# already sent are republished, and JetStream drops them by event_id.
+# series. Those bars carry warmup_bar = true on the wire; what the socket
+# delivers does not. Bars the previous process already sent are republished;
+# JetStream only drops the ones inside NATS_DUPLICATE_WINDOW_SECONDS, so size
+# that window for this replay span.
 backfill_on_start = true
 
 # Closed bars read per stream by that backfill — the recovery window is this ×
 # the timeframe: 16 bars of M15 = 4 hours. Only used when backfill_on_start is
-# true; the live socket needs no catch-up window. Max 1000 (Binance's own
-# per-request limit).
-catchup_bars = 16
+# true; the live socket needs no warm-up window. It also sizes that window on
+# the wire: each backfilled bar carries warmup_index of warmup_total, and
+# warmup_total is how many bars Binance actually returned — this number for a
+# stream with that much history, fewer for one listed more recently.
+# Max 1000 (Binance's own per-request limit).
+warmup_bars = 16
 
 # The full REST klines endpoint that backfill reads. Its path differs per
 # product, so it is written out rather than derived from ws_url:

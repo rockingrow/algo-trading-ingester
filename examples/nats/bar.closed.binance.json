@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.0.0",
   "event_id": "binance:BTCUSDT:M15:1790589600",
   "event_type": "bar.closed",
   "source": {
@@ -9,6 +9,9 @@
     "venue": "stream.binance.com"
   },
   "emitted_at": "2026-09-28T10:15:00.318000Z",
+  "warmup_bar": false,
+  "warmup_index": null,
+  "warmup_total": null,
   "symbol": "BTCUSDT",
   "timeframe": "M15",
   "bar": {

@@ -21,6 +21,20 @@ class FakePublisher:
     self.events.append(event)
 
 
+def warmup_series(
+  publisher: FakePublisher,
+) -> list[tuple[bool, int | None, int | None]]:
+  """``(warmup_bar, warmup_index, warmup_total)`` per event, in publish order.
+
+  The order is the assertion: a warm-up window reaches the subscriber as a
+  contiguous ``1 .. total`` series, oldest first, before any live bar.
+  """
+  return [
+    (event.warmup_bar, event.warmup_index, event.warmup_total)
+    for event in publisher.events
+  ]
+
+
 class FakeNotifier:
   def __init__(self) -> None:
     self.messages: list[str] = []

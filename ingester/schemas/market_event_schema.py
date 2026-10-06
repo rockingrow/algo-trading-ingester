@@ -134,20 +134,69 @@ class BarClosedEvent(MarketEvent):
   """Published once per completed bar per (gateway, symbol, timeframe)."""
 
   event_type: Literal[EventTypeEnum.BAR_CLOSED] = EventTypeEnum.BAR_CLOSED
+  #: True when this process read the bar back at start-up (the warm-up window)
+  #: rather than publishing it as it closed — a subscriber can warm indicators
+  #: on it without acting on it. It describes *this delivery*, not the bar: the
+  #: same bar published live by the previous process carries ``false``. The
+  #: whole window is published oldest first, before any live bar.
+  warmup_bar: bool = False
+  #: Position of this bar inside that warm-up window, ``1 .. warmup_total``,
+  #: oldest first. ``None`` on a live bar.
+  warmup_index: int | None = Field(default=None, ge=1)
+  #: Bars in that warm-up window. It is how many the gateway actually read back
+  #: for this stream, bounded by the market file's ``warmup_bars`` and shorter
+  #: when the venue has less history — so ``warmup_index == warmup_total``
+  #: always marks the last warm-up bar exactly once, and a subscriber waiting
+  #: for it can never wait forever. ``None`` on a live bar.
+  warmup_total: int | None = Field(default=None, ge=1)
   symbol: str
   timeframe: Timeframe
   bar: Bar
 
+  @model_validator(mode="after")
+  def _check_warmup(self) -> BarClosedEvent:
+    """A warm-up bar is numbered, a live bar is not.
+
+    The subscriber ends its warm-up on ``warmup_index == warmup_total``, so a
+    half-numbered series would leave it waiting for a message that never comes.
+    Rejecting it here means no gateway can publish one.
+    """
+    if self.warmup_bar:
+      if self.warmup_index is None or self.warmup_total is None:
+        raise ValueError("a warmup bar must carry both warmup_index and warmup_total")
+      if self.warmup_index > self.warmup_total:
+        raise ValueError("warmup_index must be <= warmup_total")
+    elif self.warmup_index is not None or self.warmup_total is not None:
+      raise ValueError("warmup_index and warmup_total belong to a warmup bar only")
+    return self
+
   @classmethod
   def create(
-    cls, *, source: EventSource, symbol: str, timeframe: Timeframe, bar: Bar
+    cls,
+    *,
+    source: EventSource,
+    symbol: str,
+    timeframe: Timeframe,
+    bar: Bar,
+    warmup_bar: bool = False,
+    warmup_index: int | None = None,
+    warmup_total: int | None = None,
   ) -> BarClosedEvent:
     """Build the event with its deterministic id."""
     open_epoch = int(bar.open_time.timestamp())
+    # The three warm-up fields are deliberately left out of the id: a bar can
+    # reach a subscriber twice — live from one process, warm-up from the next —
+    # and JetStream keeps whichever lands first, so they cannot be part of the
+    # key that decides they are the same bar. The numbers describe the window
+    # rather than the bar anyway: the same bar is 150 of 150 for one start-up
+    # and 1 of 150 for the next.
     event_id = f"{source.gateway.value}:{symbol}:{timeframe.value}:{open_epoch}"
     return cls(
       event_id=event_id,
       source=source,
+      warmup_bar=warmup_bar,
+      warmup_index=warmup_index,
+      warmup_total=warmup_total,
       symbol=symbol,
       timeframe=timeframe,
       bar=bar,

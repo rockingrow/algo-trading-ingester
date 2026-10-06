@@ -20,7 +20,7 @@ enable = true
 symbols = ["XAUUSD", "EURUSD"]
 timeframes = ["m1", "M15"]
 server_timezone = "Europe/Athens"
-catchup_bars = 16
+warmup_bars = 16
 backfill_on_start = true
 """
 
@@ -29,7 +29,7 @@ CRYPTO_TOML = """
 enable = true
 symbols = ["BTCUSDT"]
 timeframes = ["H1"]
-catchup_bars = 16
+warmup_bars = 16
 backfill_on_start = true
 """
 
@@ -114,7 +114,7 @@ def test_market_file_fills_the_gateway_settings(tmp_path):
   assert config.SYMBOLS == ["XAUUSD", "EURUSD"]
   assert config.TIMEFRAMES == [Timeframe.M1, Timeframe.M15]
   assert config.SERVER_TIMEZONE == "Europe/Athens"
-  assert config.CATCHUP_BARS == 16
+  assert config.WARMUP_BARS == 16
   assert config.BACKFILL_ON_START is True
   # The market is the file's name, never repeated inside the table.
   assert config.MARKET is MarketEnum.FOREX
@@ -128,17 +128,17 @@ def test_crypto_file_yields_binance_settings(tmp_path):
   assert config.MARKET is MarketEnum.CRYPTO
   assert config.SYMBOLS == ["BTCUSDT"]
   assert config.TIMEFRAMES == [Timeframe.H1]
-  assert config.CATCHUP_BARS == 16
+  assert config.WARMUP_BARS == 16
   assert config.BACKFILL_ON_START is True
 
 
-def test_binance_catchup_bars_is_bounded_by_the_venue_limit(tmp_path):
+def test_binance_warmup_bars_is_bounded_by_the_venue_limit(tmp_path):
   # Binance refuses a limit above 1000, so a table asking for more is refused
   # at start-up rather than on the first request.
   write(
     tmp_path,
     "crypto.toml",
-    "[binance]\nenable = true\ncatchup_bars = 1001\n",
+    "[binance]\nenable = true\nwarmup_bars = 1001\n",
   )
   with pytest.raises(MarketConfigError, match="invalid"):
     load_market(MarketEnum.CRYPTO, tmp_path)
@@ -197,7 +197,7 @@ def test_mistyped_key_is_reported(tmp_path):
 
 
 def test_invalid_value_is_reported(tmp_path):
-  write(tmp_path, "forex.toml", "[mt5]\nenable = true\ncatchup_bars = 0\n")
+  write(tmp_path, "forex.toml", "[mt5]\nenable = true\nwarmup_bars = 0\n")
   with pytest.raises(MarketConfigError, match="invalid"):
     load_market(MarketEnum.FOREX, tmp_path)
 

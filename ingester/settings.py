@@ -257,7 +257,7 @@ class Mt5Settings(GatewaySettings):
   SYMBOL_SUFFIX: str = ""
   #: Publish the closed bars found at start-up instead of only recording them.
   #: Recovers the bars a crash or restart would otherwise skip, bounded by
-  #: ``CATCHUP_BARS``. Safe with JetStream, which de-duplicates on ``event_id``.
+  #: ``WARMUP_BARS``. Safe with JetStream, which de-duplicates on ``event_id``.
   BACKFILL_ON_START: bool = False
   #: terminal64.exe path; blank = the terminal the MetaTrader5 package finds.
   TERMINAL_PATH: str = ""
@@ -273,7 +273,7 @@ class Mt5Settings(GatewaySettings):
   #: How often the watcher thread checks for a newly closed bar.
   POLL_INTERVAL_SECONDS: float = 1.0
   #: Closed bars fetched per check — how many bars a short outage can recover.
-  CATCHUP_BARS: int = Field(default=5, ge=1)
+  WARMUP_BARS: int = Field(default=5, ge=1)
   RECONNECT_INTERVAL_SECONDS: float = 5.0
 
   @field_validator("LOGIN", mode="before")
@@ -298,14 +298,14 @@ class BinanceSettings(GatewaySettings):
   WS_URL: str = "wss://stream.binance.com:9443/stream"
   #: Publish the closed bars the REST klines endpoint reports at start-up
   #: instead of waiting for the websocket's first close. Recovers the bars a
-  #: crash or restart would otherwise skip, bounded by ``CATCHUP_BARS``. Safe
+  #: crash or restart would otherwise skip, bounded by ``WARMUP_BARS``. Safe
   #: with JetStream, which de-duplicates on ``event_id``.
   BACKFILL_ON_START: bool = False
   #: Closed bars read per stream by that backfill — how long an outage it can
   #: recover is this × the timeframe. Only used when ``BACKFILL_ON_START`` is
-  #: on: the websocket needs no catch-up window, it pushes every close. 1000
+  #: on: the websocket needs no warm-up window, it pushes every close. 1000
   #: is Binance's own per-request limit.
-  CATCHUP_BARS: int = Field(default=5, ge=1, le=1000)
+  WARMUP_BARS: int = Field(default=5, ge=1, le=1000)
   #: The full REST klines endpoint the backfill reads, because its path differs
   #: per product: ``https://testnet.binance.vision/api/v3/klines`` for the
   #: testnet, ``https://fapi.binance.com/fapi/v1/klines`` for USD-M futures.
