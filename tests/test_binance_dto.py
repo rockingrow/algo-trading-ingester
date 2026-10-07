@@ -73,7 +73,7 @@ def test_negative_volume_is_rejected():
     BinanceKlineDTO.model_validate(candle(v="-1"))
 
 
-# ── REST rows (the backfill's payload) ──────────────────────────────
+# ── REST rows (a history reply's source) ──────────────────────────────
 
 
 def test_a_rest_row_becomes_the_same_bar_as_a_websocket_kline():

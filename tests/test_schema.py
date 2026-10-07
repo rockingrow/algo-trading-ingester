@@ -71,6 +71,17 @@ def test_bar_closed_event_id_is_deterministic():
   assert one.schema_version == settings.contract.VERSION
 
 
+def test_a_bar_closed_event_carries_no_warmup_fields():
+  # History is asked for, not replayed onto this subject, so nothing on the
+  # wire has to say which of the two a message is.
+  event = BarClosedEvent.create(
+    source=SOURCE, symbol="XAUUSD", timeframe=Timeframe.M15, bar=make_bar()
+  )
+  assert not {"warmup_bar", "warmup_index", "warmup_total"} & set(
+    event.model_dump(mode="json")
+  )
+
+
 def test_subject_tokens_sanitise_symbol_but_payload_keeps_it():
   event = BarClosedEvent.create(
     source=SOURCE, symbol="XAUUSD.m", timeframe=Timeframe.H1, bar=make_bar()

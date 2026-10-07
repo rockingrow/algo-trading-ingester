@@ -33,7 +33,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, ClassVar
 
-from pydantic import Field, SkipValidation, ValidationError, field_validator
+from pydantic import (
+  Field,
+  SkipValidation,
+  ValidationError,
+  field_validator,
+  model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from ingester.schemas.enums import GatewayEnum, MarketEnum, Timeframe
@@ -135,7 +141,17 @@ class LoggingSettings(BaseSettings):
 
 
 class NatsSettings(BaseSettings):
-  """NATS publishing — one-way, the ingester never subscribes (prefix ``NATS_``)."""
+  """NATS — bars published one way, history served on request (prefix ``NATS_``).
+
+  Two subject trees, kept apart on purpose:
+
+  * ``<SUBJECT_PREFIX>.>`` — what the ingester publishes. With JetStream on, the
+    stream captures all of it.
+  * ``<rpc_prefix>.>`` — what the ingester is asked. Core NATS request/reply,
+    never persisted. It must not sit under ``SUBJECT_PREFIX``: the stream would
+    store every request as if it were market data, and answer it with its own
+    acknowledgement before the ingester could.
+  """
 
   model_config = _config("NATS_")
 
@@ -153,10 +169,42 @@ class NatsSettings(BaseSettings):
   #: How long the stream keeps a bar (only used when the stream is created).
   STREAM_MAX_AGE_SECONDS: float = 7 * 24 * 3600
   DUPLICATE_WINDOW_SECONDS: float = 120.0
+  #: First token of every request subject:
+  #: ``<prefix>.history.<gateway>.<symbol>.<timeframe>``. Blank derives it from
+  #: ``SUBJECT_PREFIX`` (``INGESTER`` → ``INGESTER_RPC``), which is what the
+  #: subscriber assumes too.
+  RPC_SUBJECT_PREFIX: str = ""
+  #: Most bars one history request is answered with, whatever it asks for. The
+  #: reply is one NATS message, so this is also bounded by the server's
+  #: ``max_payload``; a reply over either limit keeps the newest bars and says
+  #: ``truncated``.
+  HISTORY_MAX_BARS: int = Field(default=5000, ge=1)
+  #: Seconds a gateway may take to read the bars for one request before the
+  #: caller is told ``timeout``.
+  HISTORY_TIMEOUT: float = Field(default=20.0, gt=0)
+
+  @model_validator(mode="after")
+  def _keep_requests_out_of_the_stream(self) -> NatsSettings:
+    publish_prefix = self.SUBJECT_PREFIX
+    if self.rpc_prefix == publish_prefix or self.rpc_prefix.startswith(
+      f"{publish_prefix}."
+    ):
+      raise ValueError(
+        f"NATS_RPC_SUBJECT_PREFIX {self.rpc_prefix!r} sits under "
+        f"NATS_SUBJECT_PREFIX {publish_prefix!r}: the JetStream stream listens on "
+        f"{publish_prefix}.> and would capture every request. Use a prefix of "
+        "its own, or leave it blank."
+      )
+    return self
 
   @property
   def url(self) -> str:
     return f"nats://{self.HOST}:{self.PORT}"
+
+  @property
+  def rpc_prefix(self) -> str:
+    """The request prefix: configured, or ``<stream name>_RPC``."""
+    return self.RPC_SUBJECT_PREFIX.strip(".") or f"{self.stream_name}_RPC"
 
   @property
   def stream_name(self) -> str:
@@ -255,10 +303,6 @@ class Mt5Settings(GatewaySettings):
   #: Forces the broker's affix when auto-detection is ambiguous (Exness: ``m``,
   #: so ``XAUUSD`` is read from ``XAUUSDm``). Blank = detect it per symbol.
   SYMBOL_SUFFIX: str = ""
-  #: Publish the closed bars found at start-up instead of only recording them.
-  #: Recovers the bars a crash or restart would otherwise skip, bounded by
-  #: ``CATCHUP_BARS``. Safe with JetStream, which de-duplicates on ``event_id``.
-  BACKFILL_ON_START: bool = False
   #: terminal64.exe path; blank = the terminal the MetaTrader5 package finds.
   TERMINAL_PATH: str = ""
   #: Leave LOGIN blank to attach to whichever account the terminal is logged in.
@@ -272,8 +316,10 @@ class Mt5Settings(GatewaySettings):
   SERVER_TIMEZONE: str = "UTC"
   #: How often the watcher thread checks for a newly closed bar.
   POLL_INTERVAL_SECONDS: float = 1.0
-  #: Closed bars fetched per check — how many bars a short outage can recover.
-  CATCHUP_BARS: int = Field(default=5, ge=1)
+  #: Closed bars read per check — how many bars a terminal outage can recover
+  #: once it reconnects. It has nothing to do with a subscriber's indicator
+  #: window: that is asked for, in whatever size the subscriber wants.
+  RECOVERY_BARS: int = Field(default=5, ge=1)
   RECONNECT_INTERVAL_SECONDS: float = 5.0
 
   @field_validator("LOGIN", mode="before")
@@ -296,23 +342,14 @@ class BinanceSettings(GatewaySettings):
   #: Combined-stream endpoint. ``wss://testnet.binance.vision/stream`` for the
   #: testnet; ``wss://fstream.binance.com/stream`` for USD-M futures.
   WS_URL: str = "wss://stream.binance.com:9443/stream"
-  #: Publish the closed bars the REST klines endpoint reports at start-up
-  #: instead of waiting for the websocket's first close. Recovers the bars a
-  #: crash or restart would otherwise skip, bounded by ``CATCHUP_BARS``. Safe
-  #: with JetStream, which de-duplicates on ``event_id``.
-  BACKFILL_ON_START: bool = False
-  #: Closed bars read per stream by that backfill — how long an outage it can
-  #: recover is this × the timeframe. Only used when ``BACKFILL_ON_START`` is
-  #: on: the websocket needs no catch-up window, it pushes every close. 1000
-  #: is Binance's own per-request limit.
-  CATCHUP_BARS: int = Field(default=5, ge=1, le=1000)
-  #: The full REST klines endpoint the backfill reads, because its path differs
-  #: per product: ``https://testnet.binance.vision/api/v3/klines`` for the
+  #: The full REST klines endpoint a history request is answered from — the
+  #: websocket only carries bars that close while it is connected. Its path
+  #: differs per product: ``https://testnet.binance.vision/api/v3/klines`` for the
   #: testnet, ``https://fapi.binance.com/fapi/v1/klines`` for USD-M futures.
   #: Keep it on the same product as ``WS_URL`` or the two disagree about which
   #: book the bars came from.
   KLINES_URL: str = "https://api.binance.com/api/v3/klines"
-  #: Seconds a single backfill request may take.
+  #: Seconds a single klines request may take.
   HTTP_TIMEOUT_SECONDS: float = 10.0
   #: Seconds before a dropped socket is dialled again.
   RECONNECT_INTERVAL_SECONDS: float = 5.0

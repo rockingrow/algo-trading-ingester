@@ -27,21 +27,13 @@ timeframes = ["M5", "M15"]
 #   wss://fstream.binance.com/stream      — USD-M futures
 ws_url = "wss://stream.binance.com:9443/stream"
 
-# The websocket only carries bars that close while it is connected, so by
-# default the bars that closed before this process started are never published.
-# true = read them back from Binance's REST klines endpoint once the socket is
-# open and publish them first, so a subscriber gets backfill + live bars as one
-# series. Turn NATS_JETSTREAM_ENABLED on with it: bars the previous process
-# already sent are republished, and JetStream drops them by event_id.
-backfill_on_start = true
-
-# Closed bars read per stream by that backfill — the recovery window is this ×
-# the timeframe: 16 bars of M15 = 4 hours. Only used when backfill_on_start is
-# true; the live socket needs no catch-up window. Max 1000 (Binance's own
-# per-request limit).
-catchup_bars = 16
-
-# The full REST klines endpoint that backfill reads. Its path differs per
+# The websocket only carries bars that close while it is connected, so the bars
+# that closed before this process started are never published. A subscriber
+# that needs them asks, naming the symbol, the timeframe and how many, and is
+# answered from the REST klines endpoint below — at most 999 closed bars per
+# request, Binance's own limit less the bar still forming.
+#
+# The full REST klines endpoint a history request reads. Its path differs per
 # product, so it is written out rather than derived from ws_url:
 #   https://testnet.binance.vision/api/v3/klines   — testnet
 #   https://fapi.binance.com/fapi/v1/klines        — USD-M futures
@@ -49,7 +41,7 @@ catchup_bars = 16
 # the bars came from.
 klines_url = "https://api.binance.com/api/v3/klines"
 
-# Seconds a single backfill request may take
+# Seconds a single klines request may take
 http_timeout_seconds = 10.0
 
 # Seconds before a dropped socket is dialled again

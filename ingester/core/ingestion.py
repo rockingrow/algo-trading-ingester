@@ -17,14 +17,18 @@ differs. The core owns the shared part, the gateway supplies the rest
   dispatcher that publishes canonical events, status tracking and operator
   notifications. Subclasses implement ``_start_source`` / ``_stop_source``.
   It also keeps the per-stream record of the newest bar already emitted, so
-  every gateway de-duplicates the same way.
+  every gateway de-duplicates the same way, and declares
+  :meth:`~BaseIngestion.fetch_history` — the one thing a gateway is *asked*
+  rather than left to push.
 * :class:`AsyncStreamIngestion` — for venues that push frames over an asyncio
   connection (the Binance websocket). Runs one task with a connect → receive →
   reconnect loop. Subclasses implement ``connect``, ``receive``, ``handle`` and
   ``disconnect``.
 * :class:`ThreadedIngestion` — for venues whose SDK is blocking (MetaTrader 5).
   Runs one dedicated thread with a connect → poll → reconnect loop. Subclasses
-  implement only ``connect``, ``poll`` and ``disconnect``.
+  implement only ``connect``, ``poll`` and ``disconnect``. The same thread
+  serves calls handed to it from the event loop, so a history read never
+  touches a thread-affine SDK from the wrong thread.
 
 The core depends on the :class:`EventPublisher` and :class:`Notifier`
 abstractions, never on NATS or Telegram directly.
@@ -33,12 +37,20 @@ abstractions, never on NATS or Telegram directly.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import queue
 import threading
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, ClassVar
 
-from ingester.core.errors import GatewayConnectionError
+from ingester.core.errors import (
+  GatewayConnectionError,
+  HistoryUnavailableError,
+  UnknownSymbolError,
+)
 from ingester.helpers import messages
 from ingester.interfaces.notifier_protocol import Notifier
 from ingester.interfaces.publisher_protocol import EventPublisher
@@ -107,6 +119,9 @@ class BaseIngestion(ABC):
     self._last_published_at: datetime | None = None
     self._last_error: str | None = None
     self._last_bar: dict[str, str] = {}
+    #: History requests answered and refused, for the /status endpoint.
+    self._history_served = 0
+    self._history_refused = 0
     #: Open time of the newest bar already emitted, per stream, in the venue's
     #: own integer clock (MT5: server-clock seconds, Binance: milliseconds).
     #: Kept across reconnects, so a replayed or re-read bar is recognised.
@@ -182,7 +197,49 @@ class BaseIngestion(ABC):
       ),
       "last_error": self._last_error,
       "last_bar_open_time": dict(self._last_bar),
+      "history_served": self._history_served,
+      "history_refused": self._history_refused,
     }
+
+  @property
+  def source(self) -> EventSource:
+    """Where this gateway's data comes from, as stamped on what it sends."""
+    return self._source
+
+  async def fetch_history(
+    self, symbol: str, timeframe: Timeframe, count: int
+  ) -> tuple[str, list[Bar]]:
+    """The newest *count* closed bars of one series, oldest first.
+
+    Returns the symbol as the market file spells it alongside the bars, so a
+    request that named it in another case is answered with the same name a
+    ``bar.closed`` event carries. Runs on the event loop; a gateway whose SDK
+    is thread-affine hands the read to its own thread.
+
+    Raises :class:`UnknownSymbolError` for a symbol this gateway is not
+    configured for, and :class:`HistoryUnavailableError` when the venue cannot
+    be read right now.
+    """
+    configured = self._configured_name(symbol)
+    try:
+      bars = await self._read_history(configured, timeframe, count)
+    except BaseException:
+      self._history_refused += 1
+      raise
+    self._history_served += 1
+    return configured, bars
+
+  def _configured_name(self, symbol: str) -> str:
+    """*symbol* as the market file writes it, matched without regard to case."""
+    wanted = symbol.strip().upper()
+    for configured in self._config.SYMBOLS:
+      if configured.upper() == wanted:
+        return configured
+    self._history_refused += 1
+    raise UnknownSymbolError(
+      f"{self.gateway.value} is not configured for {symbol!r} "
+      f"(configured: {', '.join(self._config.SYMBOLS) or 'none'})"
+    )
 
   # ── For subclasses ────────────────────────────────────────────────
 
@@ -193,6 +250,16 @@ class BaseIngestion(ABC):
   @abstractmethod
   async def _stop_source(self) -> None:
     """Stop producing data. After it returns, no more ``emit_*`` calls happen."""
+
+  async def _read_history(
+    self, symbol: str, timeframe: Timeframe, count: int
+  ) -> list[Bar]:
+    """Read *count* closed bars of a configured *symbol* from the venue.
+
+    Not abstract: a gateway with nothing to read history from keeps this, and
+    its requests are answered ``unavailable`` rather than left to time out.
+    """
+    raise HistoryUnavailableError(f"{self.gateway.value} serves no history")
 
   def _set_venue(self, venue: str | None) -> None:
     """Record the venue-side origin (e.g. the MT5 trade server) on events."""
@@ -275,6 +342,9 @@ class BaseIngestion(ABC):
     task.add_done_callback(self._background.discard)
 
   async def _dispatch_loop(self) -> None:
+    # One event at a time, in the order the gateway emitted it: a subscriber
+    # reads a series forward-only, so a bar overtaken by a newer one is a bar
+    # it drops as stale.
     assert self._queue is not None
     while True:
       event = await self._queue.get()
@@ -455,6 +525,13 @@ class ThreadedIngestion(BaseIngestion):
     self._join_timeout = join_timeout
     self._stop_event = threading.Event()
     self._thread: threading.Thread | None = None
+    #: Calls handed over from the event loop, each with the future its result
+    #: goes back on. Served between polls, on the gateway thread.
+    self._calls: queue.SimpleQueue[
+      tuple[Callable[[], Any], concurrent.futures.Future[Any]]
+    ] = queue.SimpleQueue()
+    #: Ends the wait between polls early: a call is queued, or a stop was asked.
+    self._wake = threading.Event()
 
   # ── Hooks: the gateway's business logic ───────────────────────────
 
@@ -484,6 +561,7 @@ class ThreadedIngestion(BaseIngestion):
 
   async def _stop_source(self) -> None:
     self._stop_event.set()
+    self._wake.set()
     if self._thread is not None:
       await asyncio.to_thread(self._thread.join, self._join_timeout)
       if self._thread.is_alive():
@@ -491,6 +569,55 @@ class ThreadedIngestion(BaseIngestion):
           "%s thread did not stop within %.0fs", self.gateway.value, self._join_timeout
         )
       self._thread = None
+
+  # ── Calls from the event loop ─────────────────────────────────────
+
+  async def _call_on_thread(self, call: Callable[[], Any]) -> Any:
+    """Run *call* on the gateway thread and return what it returns.
+
+    The thread owns the venue session, and an SDK such as MetaTrader5 keeps
+    thread-affine global state, so anything that reads the venue outside a poll
+    has to be queued here rather than run where it was asked for. Raises
+    whatever *call* raises, and :class:`HistoryUnavailableError` when the
+    thread is not there to run it or the venue is not connected.
+    """
+    thread = self._thread
+    if thread is None or not thread.is_alive() or self._stop_event.is_set():
+      raise HistoryUnavailableError(f"{self.gateway.value} is not running")
+    future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+    self._calls.put((call, future))
+    self._wake.set()
+    return await asyncio.wrap_future(future)
+
+  def _serve_calls(self, connected: bool) -> None:
+    """Run every queued call. Only ever called on the gateway thread."""
+    while True:
+      try:
+        call, future = self._calls.get_nowait()
+      except queue.Empty:
+        return
+      if not future.set_running_or_notify_cancel():
+        continue
+      if not connected:
+        future.set_exception(
+          HistoryUnavailableError(f"{self.gateway.value} is not connected to its venue")
+        )
+        continue
+      try:
+        future.set_result(call())
+      except BaseException as exc:
+        future.set_exception(exc)
+
+  def _idle(self, seconds: float, *, connected: bool) -> None:
+    """Wait out *seconds*, serving queued calls as they arrive."""
+    deadline = time.monotonic() + seconds
+    while not self._stop_event.is_set():
+      self._serve_calls(connected)
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        return
+      self._wake.wait(remaining)
+      self._wake.clear()
 
   # ── Thread body ───────────────────────────────────────────────────
 
@@ -501,7 +628,7 @@ class ThreadedIngestion(BaseIngestion):
         if not connected:
           connected = self._try_connect()
           if not connected:
-            self._stop_event.wait(self._reconnect_interval)
+            self._idle(self._reconnect_interval, connected=False)
             continue
 
         try:
@@ -511,13 +638,19 @@ class ThreadedIngestion(BaseIngestion):
           self._set_status(GatewayStatusEnum.DISCONNECTED, str(exc))
           self._safe_disconnect()
           connected = False
+          # Answer whoever is waiting before dialling again: the reconnect
+          # below may succeed and fail in a loop, and never reach an idle wait.
+          self._serve_calls(connected=False)
           continue
         except Exception:
           # A bug in one poll must not kill the feed; the next poll retries.
           log.exception("%s poll failed", self.gateway.value)
 
-        self._stop_event.wait(self._poll_interval)
+        self._idle(self._poll_interval, connected=True)
     finally:
+      # Nobody will serve these now; answer them rather than leave their
+      # callers waiting on a thread that has gone.
+      self._serve_calls(connected=False)
       if connected:
         self._safe_disconnect()
 

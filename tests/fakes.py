@@ -197,6 +197,9 @@ class FakeTerminal:
     self.initialize_ok = True
     self.initialize_calls = 0
     self.shutdown_calls = 0
+    #: ``(thread name, count)`` per rates read — which thread touched the
+    #: terminal, and how many bars it asked for.
+    self.reads: list[tuple[str, int]] = []
 
   def set_rates(self, symbol: str, timeframe: Timeframe, records: list[dict]) -> None:
     with self._lock:
@@ -234,6 +237,7 @@ class FakeTerminal:
     self, symbol: str, timeframe: Timeframe, start_pos: int, count: int
   ) -> list[dict[str, Any]] | None:
     with self._lock:
+      self.reads.append((threading.current_thread().name, count))
       records = self.rates.get((symbol, timeframe))
       if records is None:
         return None

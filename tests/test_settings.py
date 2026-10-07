@@ -20,8 +20,7 @@ enable = true
 symbols = ["XAUUSD", "EURUSD"]
 timeframes = ["m1", "M15"]
 server_timezone = "Europe/Athens"
-catchup_bars = 16
-backfill_on_start = true
+recovery_bars = 16
 """
 
 CRYPTO_TOML = """
@@ -29,8 +28,7 @@ CRYPTO_TOML = """
 enable = true
 symbols = ["BTCUSDT"]
 timeframes = ["H1"]
-catchup_bars = 16
-backfill_on_start = true
+http_timeout_seconds = 3.0
 """
 
 
@@ -114,8 +112,7 @@ def test_market_file_fills_the_gateway_settings(tmp_path):
   assert config.SYMBOLS == ["XAUUSD", "EURUSD"]
   assert config.TIMEFRAMES == [Timeframe.M1, Timeframe.M15]
   assert config.SERVER_TIMEZONE == "Europe/Athens"
-  assert config.CATCHUP_BARS == 16
-  assert config.BACKFILL_ON_START is True
+  assert config.RECOVERY_BARS == 16
   # The market is the file's name, never repeated inside the table.
   assert config.MARKET is MarketEnum.FOREX
 
@@ -128,20 +125,45 @@ def test_crypto_file_yields_binance_settings(tmp_path):
   assert config.MARKET is MarketEnum.CRYPTO
   assert config.SYMBOLS == ["BTCUSDT"]
   assert config.TIMEFRAMES == [Timeframe.H1]
-  assert config.CATCHUP_BARS == 16
-  assert config.BACKFILL_ON_START is True
+  assert config.HTTP_TIMEOUT_SECONDS == 3.0
 
 
-def test_binance_catchup_bars_is_bounded_by_the_venue_limit(tmp_path):
-  # Binance refuses a limit above 1000, so a table asking for more is refused
-  # at start-up rather than on the first request.
-  write(
-    tmp_path,
-    "crypto.toml",
-    "[binance]\nenable = true\ncatchup_bars = 1001\n",
+@pytest.mark.parametrize(
+  ("table", "key"),
+  [
+    ("mt5", "warmup_bars = 150"),
+    ("mt5", "backfill_on_start = true"),
+    ("binance", "warmup_bars = 16"),
+    ("binance", "backfill_on_start = true"),
+  ],
+)
+def test_the_retired_warmup_keys_are_refused_by_name(tmp_path, table, key):
+  # The subscriber decides what to warm and how much; a market file still
+  # carrying these would otherwise look as though it did.
+  market = MarketEnum.FOREX if table == "mt5" else MarketEnum.CRYPTO
+  write(tmp_path, f"{market.value}.toml", f"[{table}]\nenable = true\n{key}\n")
+  with pytest.raises(MarketConfigError, match="unknown key"):
+    load_market(market, tmp_path)
+
+
+def test_rpc_prefix_is_derived_from_the_subject_prefix():
+  assert NatsSettings(_env_file=None, SUBJECT_PREFIX="INGESTER").rpc_prefix == (
+    "INGESTER_RPC"
   )
-  with pytest.raises(MarketConfigError, match="invalid"):
-    load_market(MarketEnum.CRYPTO, tmp_path)
+  assert (
+    NatsSettings(_env_file=None, SUBJECT_PREFIX="DESK.MT5").rpc_prefix == "DESK_RPC"
+  )
+  assert NatsSettings(_env_file=None, RPC_SUBJECT_PREFIX="ASK.").rpc_prefix == "ASK"
+
+
+@pytest.mark.parametrize("rpc_prefix", ["INGESTER", "INGESTER.rpc", "INGESTER.rpc.v1"])
+def test_an_rpc_prefix_inside_the_published_tree_is_refused(rpc_prefix):
+  # The stream listens on INGESTER.> — it would store every request and answer
+  # it with its own acknowledgement before the ingester could.
+  with pytest.raises(ValidationError, match="sits under"):
+    NatsSettings(
+      _env_file=None, SUBJECT_PREFIX="INGESTER", RPC_SUBJECT_PREFIX=rpc_prefix
+    )
 
 
 def test_env_fills_what_the_table_leaves_out(tmp_path, monkeypatch):
@@ -197,7 +219,7 @@ def test_mistyped_key_is_reported(tmp_path):
 
 
 def test_invalid_value_is_reported(tmp_path):
-  write(tmp_path, "forex.toml", "[mt5]\nenable = true\ncatchup_bars = 0\n")
+  write(tmp_path, "forex.toml", "[mt5]\nenable = true\nrecovery_bars = 0\n")
   with pytest.raises(MarketConfigError, match="invalid"):
     load_market(MarketEnum.FOREX, tmp_path)
 

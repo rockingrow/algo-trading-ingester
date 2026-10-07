@@ -13,10 +13,12 @@ Market-data gateway. One process runs several **markets** side by side
 (`SOURCE_MARKET=forex,crypto`), each market's gateways read from
 `config/<market>.toml`. Every gateway (MetaTrader 5 for forex, the Binance
 websocket for crypto) detects **closed bars**, turns the venue payload into the
-canonical `BarClosedEvent` through its DTO, and publishes it **one way** to NATS
-on `<NATS_SUBJECT_PREFIX>.bar.closed.<gateway>.<symbol>.<timeframe>`, where
+canonical `BarClosedEvent` through its DTO, and publishes it to NATS on
+`<NATS_SUBJECT_PREFIX>.bar.closed.<gateway>.<symbol>.<timeframe>`, where
 [Quant-Trading-Engine](https://github.com/rockingrow/quant-trading-engine)'s
-`qte-ingest` consumes it. Service status goes to Telegram. Python 3.13, uv,
+`qte-ingest` consumes it. Bars go one way; the one subscription held is for
+**history requests** on `<rpc_prefix>.history.<gateway>.<symbol>.<timeframe>`,
+answered in a single reply. Service status goes to Telegram. Python 3.13, uv,
 FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
 
 ## Rules
@@ -111,10 +113,13 @@ package; never scan from the repository root.
 | Binance bar-close detection (business logic) | `ingester/gateways/crypto/binance/ingestion.py` |
 | Binance kline → canonical `Bar`, interval mapping | `ingester/gateways/crypto/binance/dto.py` |
 | Binance websocket adapter | `ingester/gateways/crypto/binance/stream.py` |
-| Binance REST klines adapter (`backfill_on_start`) | `ingester/gateways/crypto/binance/history.py` |
+| Binance REST klines adapter (answers history requests) | `ingester/gateways/crypto/binance/history.py` |
 | MT5 rate → canonical `Bar`, server time → UTC | `ingester/gateways/forex/mt5/dto.py` |
 | MetaTrader5 package adapter | `ingester/gateways/forex/mt5/terminal.py` |
 | NATS connection and one-way publisher | `ingester/services/nats_service.py` |
+| History request/reply contract | `ingester/schemas/history_schema.py`, `examples/nats/history.*.json` |
+| History responder (the one NATS subscription), reply sizing, the `online` announcement | `ingester/services/history_service.py` |
+| Reading history from a venue | `BaseIngestion.fetch_history` / `_read_history`, `ThreadedIngestion._call_on_thread` in `ingester/core/ingestion.py` |
 | Telegram notifier, queue decorator | `ingester/services/notification_service.py` |
 | Telegram message templates, emoji | `ingester/helpers/{messages,emoji_constants}.py` |
 | Ordered start/stop of notifier, NATS, gateways | `ingester/runtime.py` |
@@ -148,8 +153,14 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
 - **A gateway's market comes from the file it is configured in.** `[mt5]` in
   `config/forex.toml` is forex. The table never repeats it, so it can never
   contradict it.
-- **One way.** The ingester publishes and never subscribes or requests. Status
-  goes to Telegram, not to NATS.
+- **Bars go one way; history is asked for.** The ingester publishes closes
+  and pushes nothing else — no warm-up window at start-up, no warm-up settings.
+  The one thing it listens for is a history request, answered in a single
+  reply; the subscriber decides which series and how many bars. Status goes to
+  Telegram, not to NATS.
+- **Requests stay out of the stream.** The request prefix is never under
+  `NATS_SUBJECT_PREFIX` (the settings refuse it): the stream captures that
+  whole tree and would store a request and answer it with its own ack.
 - **`event_id` is deterministic** (`<gateway>:<symbol>:<tf>:<open epoch>`). It
   is the subscriber's de-duplication key and the JetStream `Nats-Msg-Id`, so it
   must never include `emitted_at` or anything random.
@@ -158,7 +169,8 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
   milliseconds in UTC already; naive datetimes are rejected by the schema.
 - **Thread boundary.** Every MetaTrader5 call runs on the gateway's own thread.
   Crossing into the event loop happens only through `emit_bar` and
-  `_set_status`, which are the thread-safe entry points.
+  `_set_status`, which are the thread-safe entry points; crossing the other
+  way — a history read — only through `_call_on_thread`.
 - **Notifications never block the pipeline.** Everything goes through
   `QueuedNotifier`; a slow Telegram must not delay a bar.
 

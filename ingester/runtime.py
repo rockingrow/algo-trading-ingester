@@ -5,9 +5,9 @@ Kept apart from FastAPI so the whole lifecycle can be exercised in tests with
 fakes; ``app.py`` only calls :meth:`start` / :meth:`stop` from its lifespan.
 
 Start: notifier → NATS → every gateway every configured market enables →
-       "running" notification.
-Stop:  gateways (publishing what they already emitted) → "stopped"
-       notification → NATS drain → notifier drain.
+       the history responder → "running" notification.
+Stop:  the history responder → gateways (publishing what they already
+       emitted) → "stopped" notification → NATS drain → notifier drain.
 
 Markets run side by side: each gateway owns its own source (the MT5 gateway a
 dedicated thread, the Binance gateway an asyncio task) and its own publish
@@ -38,6 +38,14 @@ class Connection(Protocol):
   async def close(self) -> None: ...
 
 
+class HistoryResponding(Protocol):
+  """Answers history requests for the gateways it is started with."""
+
+  async def start(self, ingestions: list[Ingestion]) -> None: ...
+
+  async def stop(self) -> None: ...
+
+
 class ManagedNotifier(Notifier, Protocol):
   async def start(self) -> None: ...
 
@@ -56,6 +64,7 @@ class IngesterRuntime:
     subject_filter: str,
     log_notifier: ManagedNotifier | None = None,
     log_forwarder: LogForwarder | None = None,
+    history_responder: HistoryResponding | None = None,
   ) -> None:
     self._config = config
     self._factory = factory
@@ -68,6 +77,7 @@ class IngesterRuntime:
     self.status = ServiceStatusEnum.STOPPED
     self._log_forwarder = log_forwarder
     self._forwarding = False
+    self._history_responder = history_responder
 
   @property
   def instance_id(self) -> str:
@@ -131,6 +141,15 @@ class IngesterRuntime:
         f" — check enable in {self._config.source.CONFIG_DIR}/<market>.toml"
       )
 
+    if self._history_responder is not None and self.ingestions:
+      try:
+        await self._history_responder.start(self.ingestions)
+      except Exception as exc:
+        # Bars still flow without it; what is lost is a subscriber's ability
+        # to fill its window, which is worth a line of its own.
+        log.error("History requests cannot be served: %s", exc)
+        problems.append(f"history requests: {type(exc).__name__}: {exc}")
+
     self.status = ServiceStatusEnum.RUNNING
     log.info("Ingester running: %s", ", ".join(self._streams()) or "no gateway")
     await self._notifier.send_message(
@@ -192,6 +211,12 @@ class IngesterRuntime:
     ]
 
   async def _stop_ingestions(self) -> None:
+    # First, so no request is accepted for a gateway that is on its way down.
+    if self._history_responder is not None:
+      try:
+        await self._history_responder.stop()
+      except Exception:
+        log.exception("Failed to stop the history responder")
     for ingestion in reversed(self.ingestions):
       try:
         await ingestion.stop()

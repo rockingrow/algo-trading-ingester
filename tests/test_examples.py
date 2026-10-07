@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from ingester.schemas import BarClosedEvent, GatewayEnum, MarketEnum
+from ingester.schemas import (
+  BarClosedEvent,
+  GatewayEnum,
+  HistoryReply,
+  HistoryRequest,
+  MarketEnum,
+  OnlineAnnouncement,
+)
 from ingester.settings import MarketConfigError, load_market
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,11 +25,33 @@ EXAMPLES = ROOT / "examples" / "nats"
 CONFIG = ROOT / "config"
 
 
-@pytest.mark.parametrize("name", ["bar.closed.mt5.json", "bar.closed.binance.json"])
+@pytest.mark.parametrize(
+  "name",
+  [
+    "bar.closed.mt5.json",
+    "bar.closed.binance.json",
+  ],
+)
 def test_bar_closed_example_matches_schema(name):
   raw = json.loads((EXAMPLES / name).read_text(encoding="utf-8"))
   event = BarClosedEvent.model_validate(raw)
   assert event.model_dump(mode="json") == raw
+
+
+def test_history_request_example_matches_schema():
+  raw = json.loads((EXAMPLES / "history.request.mt5.json").read_text(encoding="utf-8"))
+  assert HistoryRequest.model_validate(raw).model_dump(mode="json") == raw
+
+
+def test_online_announcement_example_matches_schema():
+  raw = json.loads((EXAMPLES / "ingester.online.mt5.json").read_text(encoding="utf-8"))
+  assert OnlineAnnouncement.model_validate(raw).model_dump(mode="json") == raw
+
+
+@pytest.mark.parametrize("name", ["history.reply.mt5.json", "history.reply.error.json"])
+def test_history_reply_example_matches_schema(name):
+  raw = json.loads((EXAMPLES / name).read_text(encoding="utf-8"))
+  assert HistoryReply.model_validate(raw).model_dump(mode="json") == raw
 
 
 @pytest.mark.parametrize(

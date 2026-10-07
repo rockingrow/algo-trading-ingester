@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from ingester.schemas.enums import EventTypeEnum, GatewayEnum, MarketEnum, Timeframe
 
 
-def _schema_version() -> str:
+def schema_version() -> str:
   """The configured ``SCHEMA_VERSION``. Imported lazily because
   ``ingester.settings`` imports this package for its enums."""
   from ingester.settings import settings
@@ -116,7 +116,7 @@ class MarketEvent(BaseModel):
 
   model_config = ConfigDict(frozen=True)
 
-  schema_version: str = Field(default_factory=_schema_version)
+  schema_version: str = Field(default_factory=schema_version)
   #: Deterministic id — the same bar always yields the same id, so it doubles as
   #: the JetStream ``Nats-Msg-Id`` and a subscriber-side de-duplication key.
   event_id: str
@@ -131,7 +131,13 @@ class MarketEvent(BaseModel):
 
 
 class BarClosedEvent(MarketEvent):
-  """Published once per completed bar per (gateway, symbol, timeframe)."""
+  """Published once per completed bar per (gateway, symbol, timeframe).
+
+  Always a close, never history: the bars that closed before a subscriber was
+  listening are not replayed onto this subject, they are asked for
+  (:mod:`ingester.schemas.history_schema`). Every message here is a bar the
+  venue has just finished, or one a reconnect recovered late.
+  """
 
   event_type: Literal[EventTypeEnum.BAR_CLOSED] = EventTypeEnum.BAR_CLOSED
   symbol: str
@@ -140,7 +146,12 @@ class BarClosedEvent(MarketEvent):
 
   @classmethod
   def create(
-    cls, *, source: EventSource, symbol: str, timeframe: Timeframe, bar: Bar
+    cls,
+    *,
+    source: EventSource,
+    symbol: str,
+    timeframe: Timeframe,
+    bar: Bar,
   ) -> BarClosedEvent:
     """Build the event with its deterministic id."""
     open_epoch = int(bar.open_time.timestamp())
