@@ -14,14 +14,9 @@ bars Binance marks closed.
   subscription in the URL, so symbols × timeframes share one connection — and
   one reconnect.
 * **Start-up**: the socket only carries bars that close while it is connected,
-  so by default the bars that closed before this process started are simply
-  not published. With ``backfill_on_start`` the gateway reads the last
-  ``warmup_bars`` closed bars per stream from the REST klines endpoint once
-  the socket is open, and publishes those first — so a subscriber gets
-  backfill and live bars as one continuous series, the bars a crash skipped
-  included. Those carry ``warmup_bar`` and are numbered ``warmup_index`` of
-  ``warmup_total``, oldest first, so a subscriber knows which one ends the
-  window; what the socket delivers carries neither.
+  so the bars that closed before this process started are not published. A
+  subscriber that needs them asks (:meth:`BinanceIngestion._read_history`) and
+  is answered from the REST klines endpoint, in one reply.
 * **De-duplication**: a reconnect can replay the bar that closed while the
   socket was down, and Binance occasionally repeats a final update. The core
   remembers the newest open time already emitted per stream, so each bar is
@@ -40,12 +35,11 @@ connect → receive → reconnect loop itself.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
-from ingester.core.errors import GatewayConnectionError
+from ingester.core.errors import GatewayConnectionError, HistoryUnavailableError
 from ingester.core.ingestion import AsyncStreamIngestion
 from ingester.gateways.crypto.binance.dto import (
   TIMEFRAME_INTERVALS,
@@ -56,10 +50,13 @@ from ingester.gateways.crypto.binance.history import KlineHistory
 from ingester.gateways.crypto.binance.stream import KlineStream
 from ingester.logger import get_logger
 from ingester.schemas.enums import GatewayEnum, Timeframe
-from ingester.schemas.market_event_schema import utcnow
+from ingester.schemas.market_event_schema import Bar, utcnow
 from ingester.settings import BinanceSettings
 
 log = get_logger(__name__)
+
+#: Rows Binance returns for one klines request, at most.
+KLINES_LIMIT = 1000
 
 
 class BinanceIngestion(AsyncStreamIngestion):
@@ -103,10 +100,6 @@ class BinanceIngestion(AsyncStreamIngestion):
       for timeframe in self.timeframes
     ]
     await self._stream.open(self._binance_config.WS_URL, streams)
-    # After the socket, never before: a bar closing between the two would
-    # otherwise fall into the gap. The overlap the other way round is free —
-    # the core's de-duplication drops a backfilled bar the socket repeats.
-    await self._backfill()
 
   async def receive(self) -> Mapping[str, Any]:
     return await self._stream.receive()
@@ -156,44 +149,30 @@ class BinanceIngestion(AsyncStreamIngestion):
     self._remember_bar(symbol, timeframe, kline.open_time_ms)
     self.emit_bar(symbol, timeframe, kline.to_bar(timeframe))
 
-  # ── Backfill ──────────────────────────────────────────────────────
+  # ── History, on request ───────────────────────────────────────────
 
-  async def _backfill(self) -> None:
-    """Publish the closed bars the socket missed, oldest first.
+  async def _read_history(
+    self, symbol: str, timeframe: Timeframe, count: int
+  ) -> list[Bar]:
+    """The newest *count* closed bars, from the REST klines endpoint.
 
-    Per stream, and only for a stream nothing is remembered for yet: after a
-    reconnect the socket has already fed the others, so re-reading them would
-    only re-publish what was published seconds ago. A stream whose history
-    cannot be read is logged and skipped — the live socket is what keeps bars
-    flowing, and a REST failure must not cost it — and the next reconnect
-    tries that stream again.
+    Any timeframe Binance has may be asked for, not just the ones on the
+    socket. One request, so at most :data:`KLINES_LIMIT` rows: Binance's
+    newest row is the bar still forming, which leaves one fewer closed bar.
     """
-    if not self._binance_config.BACKFILL_ON_START:
-      return
-    for symbol in self.symbols:
-      for timeframe in self.timeframes:
-        if self._open_mark(symbol, timeframe) is not None:
-          continue
-        try:
-          await self._backfill_stream(symbol, timeframe)
-        except asyncio.CancelledError:
-          raise
-        except Exception as exc:
-          log.warning("Binance %s %s backfill failed: %s", symbol, timeframe.value, exc)
-
-  async def _backfill_stream(self, symbol: str, timeframe: Timeframe) -> None:
     interval = TIMEFRAME_INTERVALS[timeframe]
-    rows = await self._history.klines(
-      symbol=symbol,
-      interval=interval,
-      # One more than asked for: Binance's newest row is the bar still
-      # forming, and publishing it would hand strategies an unfinished candle.
-      limit=self._binance_config.WARMUP_BARS + 1,
-    )
+    try:
+      rows = await self._history.klines(
+        symbol=symbol,
+        interval=interval,
+        # One more than asked for, because the newest row is still forming and
+        # handing it over would give a strategy an unfinished candle.
+        limit=min(count + 1, KLINES_LIMIT),
+      )
+    except GatewayConnectionError as exc:
+      raise HistoryUnavailableError(str(exc)) from exc
     now_ms = int(utcnow().timestamp() * 1000)
-    # One kline per open time, oldest first. A response that repeated a bar
-    # would make the series below shorter than its own ``warmup_total``, and
-    # the subscriber waits for that number.
+    # One kline per open time, oldest first.
     by_open = {
       dto.open_time_ms: dto
       for dto in (
@@ -203,53 +182,26 @@ class BinanceIngestion(AsyncStreamIngestion):
         for row in rows
       )
     }
-    klines = [by_open[open_ms] for open_ms in sorted(by_open)]
-    closed = [kline for kline in klines if kline.is_closed]
-    # Trimmed from the newest end: a venue that hands back more rows than asked
-    # must not widen the window the operator configured.
-    closed = closed[-self._binance_config.WARMUP_BARS :]
-    # Filtered before the window is numbered, not inside the emit loop: a bar
-    # dropped halfway would leave a gap in ``warmup_index``. Nothing can be
-    # dropped today — ``_backfill`` only visits streams with no mark yet — and
-    # doing it here keeps that true however the caller changes.
-    window = [
-      kline
-      for kline in closed
-      if self._is_new_bar(symbol, timeframe, kline.open_time_ms)
+    closed = [
+      by_open[open_ms] for open_ms in sorted(by_open) if by_open[open_ms].is_closed
     ]
-    if not window:
-      log.info("Binance %s %s has no closed bar to backfill", symbol, timeframe.value)
-      return
-    # ``warmup_total`` is the length of *this* window rather than the configured
-    # ``warmup_bars``: a stream listed days ago has less history than that, and
-    # a subscriber that ends its warm-up on ``warmup_index == warmup_total``
-    # would otherwise wait for a bar Binance never had.
-    #
-    # Converted in full before the first bar is published, for the same reason:
-    # a row the schema rejects half-way through would truncate a series that
-    # has already announced its length, and the marks it moved mean the next
-    # reconnect would not retry it. Raising here publishes nothing and leaves
-    # the marks untouched, so ``_backfill`` logs the stream and the next
-    # reconnect reads it again.
-    bars = [(kline.open_time_ms, kline.to_bar(timeframe)) for kline in window]
-    total = len(bars)
+    # Trimmed from the newest end: a venue that hands back more rows than asked
+    # must not widen the window the subscriber asked for.
+    bars = [kline.to_bar(timeframe) for kline in closed[-count:]]
+    if not bars:
+      raise HistoryUnavailableError(
+        f"Binance returned no closed bar for {symbol} {timeframe.value}"
+      )
     log.info(
-      "Binance %s %s backfilling %d closed bar(s) from %s",
+      "Binance %s %s history: %d of %d bar(s) asked for, %s..%s",
       symbol,
       timeframe.value,
-      total,
-      bars[0][1].open_time.isoformat(),
+      len(bars),
+      count,
+      bars[0].open_time.isoformat(),
+      bars[-1].open_time.isoformat(),
     )
-    for index, (open_time_ms, bar) in enumerate(bars, start=1):
-      self._remember_bar(symbol, timeframe, open_time_ms)
-      self.emit_bar(
-        symbol,
-        timeframe,
-        bar,
-        warmup_bar=True,
-        warmup_index=index,
-        warmup_total=total,
-      )
+    return bars
 
   def _warn_once(self, key: str, message: str, *args: Any) -> None:
     if key in self._unknown:

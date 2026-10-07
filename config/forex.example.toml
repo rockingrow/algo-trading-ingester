@@ -42,20 +42,14 @@ server_timezone = "UTC"
 # Seconds between checks for a newly closed bar
 poll_interval_seconds = 10.0
 
-# Closed bars read per check — how many missed bars a reconnect can recover.
-# The recovery window is this × the timeframe: 150 bars of M15 = 37.5 hours.
-# With backfill_on_start it also sizes the warm-up window published at start-up:
-# each of those bars carries warmup_index of warmup_total on the wire, and
-# warmup_total is how many bars the broker actually returned — this number when
-# it has that much history, fewer when it does not.
-warmup_bars = 150
-
-# false = a restart silently skips every bar that closed while it was down.
-# true = those bars are published at start-up, bounded by warmup_bars, and
-# carry warmup_bar = true on the wire so a subscriber can warm indicators on
-# them without acting on them. Bars the previous process already sent are
-# republished; JetStream only drops the ones inside
-# NATS_DUPLICATE_WINDOW_SECONDS, so size that window for this replay span.
-backfill_on_start = false
+# Closed bars read per check — how many missed bars a terminal reconnect can
+# recover. The recovery window is this × the timeframe: 16 bars of M15 = 4
+# hours. Keep NATS_DUPLICATE_WINDOW_SECONDS at least that long, so a bar re-read
+# after an outage is not stored twice.
+#
+# This is not a warm-up window. Nothing is published at start-up: a subscriber
+# that needs the bars from before it was listening asks for them, naming the
+# symbol, the timeframe and how many — see "History requests" in the README.
+recovery_bars = 16
 
 reconnect_interval_seconds = 5.0

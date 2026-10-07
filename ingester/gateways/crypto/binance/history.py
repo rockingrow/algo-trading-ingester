@@ -3,12 +3,13 @@ ingester/gateways/crypto/binance/history.py — The seam between our code and
 Binance's REST klines endpoint.
 
 The websocket only ever delivers bars that close *while it is connected*, so
-the bars that closed before this process started are not on it. They are read
-once, over REST, by :class:`KlineHistory` — the slice of the endpoint the
-backfill needs: ``limit`` klines for one (symbol, interval), newest last.
+the bars that closed before this process started are not on it. When a
+subscriber asks for them they are read over REST by :class:`KlineHistory` — the
+slice of the endpoint a history request needs: ``limit`` klines for one
+(symbol, interval), newest last.
 
 :class:`HttpKlineHistory` implements it over ``httpx``; tests implement it with
-a fake, so the backfill logic in ``ingestion.py`` runs without a network.
+a fake, so the history logic in ``ingestion.py`` runs without a network.
 
 Rows come back as Binance sends them — plain arrays — and
 :meth:`~ingester.gateways.crypto.binance.dto.BinanceKlineDTO.from_rest_row` is
@@ -16,8 +17,8 @@ the only place that knows what sits at which index.
 
 Every failure is raised as
 :class:`~ingester.core.errors.GatewayConnectionError`: the caller's job is to
-decide whether a missing backfill is worth retrying, not to tell a 429 from a
-DNS failure.
+decide whether a request is worth retrying, not to tell a 429 from a DNS
+failure.
 """
 
 from __future__ import annotations
@@ -50,9 +51,9 @@ class KlineHistory(Protocol):
 class HttpKlineHistory:
   """:class:`KlineHistory` over ``httpx``.
 
-  A client per call rather than one kept open: the backfill is a handful of
-  requests at start-up, and a connection pool that lives for the life of the
-  process would only have to be closed again on every reconnect.
+  A client per call rather than one kept open: history is asked for a handful
+  of times when a subscriber starts, and a connection pool that lives for the
+  life of the process would sit idle for the rest of it.
   """
 
   def __init__(self, *, url: str, timeout: float) -> None:

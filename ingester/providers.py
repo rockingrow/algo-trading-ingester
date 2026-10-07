@@ -12,6 +12,7 @@ from ingester.gateways.crypto.binance import build_binance_ingestion
 from ingester.gateways.forex.mt5 import build_mt5_ingestion
 from ingester.runtime import IngesterRuntime
 from ingester.schemas.enums import GatewayEnum
+from ingester.services.history_service import HistoryResponder
 from ingester.services.nats_service import NatsConnection, NatsPublisher
 from ingester.services.notification_service import (
   NullNotifier,
@@ -63,6 +64,7 @@ def make_runtime(config: Settings) -> IngesterRuntime:
     connection=connection,
     publisher=publisher,
     subject_filter=publisher.subject_filter,
+    history_responder=HistoryResponder(connection, config.nats),
     log_notifier=error_notifier,
     log_forwarder=(
       None

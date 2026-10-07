@@ -1,6 +1,10 @@
 import pytest
 
-from ingester.core.errors import GatewayConnectionError
+from ingester.core.errors import (
+  GatewayConnectionError,
+  HistoryUnavailableError,
+  UnknownSymbolError,
+)
 from ingester.gateways.crypto.binance import BinanceIngestion
 from ingester.schemas import BarClosedEvent, GatewayStatusEnum, Timeframe
 from ingester.schemas.market_event_schema import utcnow
@@ -13,7 +17,6 @@ from tests.fakes import (
   kline,
   rest_kline,
   wait_for,
-  warmup_series,
 )
 
 M1 = Timeframe.M1
@@ -203,12 +206,12 @@ async def test_start_requires_symbols():
     await ingestion.start()
 
 
-# ── backfill_on_start ───────────────────────────────────────────────
+# ── History, on request ─────────────────────────────────────────────
 
 
-async def test_no_backfill_without_the_option():
-  # The default: nothing is read over REST, so a restart publishes only the
-  # bars that close from here on.
+async def test_a_start_reads_nothing_over_rest():
+  # Nothing is pushed at start-up any more: a restart publishes only the bars
+  # that close from here on, and history waits to be asked for.
   history = FakeKlineHistory({("BTCUSDT", "1m"): [rest_kline(T0_MS)]})
   stream = FakeKlineStream([kline(T0_MS + 60_000)])
   ingestion, publisher, _ = make_ingestion(stream, history)
@@ -220,201 +223,128 @@ async def test_no_backfill_without_the_option():
   assert int(publisher.events[0].bar.open_time.timestamp()) == (T0_MS + 60_000) // 1000
 
 
-async def test_backfill_publishes_history_then_live_bars():
-  # The point of the option: one continuous series, backfill first.
+async def test_history_returns_closed_bars_oldest_first_and_publishes_nothing():
   history = FakeKlineHistory(
     {
       ("BTCUSDT", "1m"): [
+        rest_kline(T0_MS - 120_000),
+        rest_kline(T0_MS - 60_000),
         rest_kline(T0_MS),
-        rest_kline(T0_MS + 60_000),
-        # Binance always returns the bar still forming last; its close time is
-        # in the future, so it must not be published.
-        rest_kline(int(utcnow().timestamp() * 1000) // 60_000 * 60_000),
       ]
     }
   )
-  stream = FakeKlineStream([kline(T0_MS + 120_000)])
-  ingestion, publisher, _ = make_ingestion(
-    stream, history, BACKFILL_ON_START=True, WARMUP_BARS=16
-  )
-  await ingestion.start()
-  await wait_for(lambda: len(publisher.events) == 3)
-  await ingestion.stop()
+  ingestion, publisher, _ = make_ingestion(FakeKlineStream(), history)
 
-  opens = [int(e.bar.open_time.timestamp()) for e in publisher.events]
-  assert opens == [
-    T0_MS // 1000,
-    (T0_MS + 60_000) // 1000,
-    (T0_MS + 120_000) // 1000,
+  symbol, bars = await ingestion.fetch_history("btcusdt", M1, 3)
+
+  assert symbol == "BTCUSDT"
+  assert [int(bar.open_time.timestamp() * 1000) for bar in bars] == [
+    T0_MS - 120_000,
+    T0_MS - 60_000,
+    T0_MS,
   ]
-  # What REST handed back is the numbered warm-up window, oldest first; what
-  # the socket delivered afterwards is live. The subscriber ends its warm-up on
-  # the bar where index == total.
-  assert warmup_series(publisher) == [
-    (True, 1, 2),
-    (True, 2, 2),
-    (False, None, None),
-  ]
-  bar = publisher.events[0].bar
-  assert (bar.open, bar.high, bar.low, bar.close) == (100.0, 101.0, 99.0, 100.5)
-  assert bar.quote_volume == 150.0
-  assert bar.tick_count == 42
-  # close_time is derived, not Binance's "last millisecond of the bar".
-  assert int(bar.close_time.timestamp()) == (T0_MS + 60_000) // 1000
+  assert publisher.events == []
 
 
-async def test_backfill_reads_every_stream_one_bar_past_the_window():
-  history = FakeKlineHistory()
-  ingestion, _, _ = make_ingestion(
-    FakeKlineStream(),
-    history,
-    SYMBOLS=["BTCUSDT", "ETHUSDT"],
-    TIMEFRAMES=[M1, Timeframe.M15],
-    BACKFILL_ON_START=True,
-    WARMUP_BARS=4,
-  )
-  await ingestion.start()
-  await wait_for(lambda: len(history.calls) == 4)
-  await ingestion.stop()
-
-  # limit is warmup_bars + 1: the extra row is the forming bar, dropped.
-  assert history.calls == [
-    ("BTCUSDT", "1m", 5),
-    ("BTCUSDT", "15m", 5),
-    ("ETHUSDT", "1m", 5),
-    ("ETHUSDT", "15m", 5),
-  ]
-
-
-async def test_warmup_total_is_the_window_binance_returned_not_warmup_bars():
-  # Three closed bars of history against warmup_bars = 16. A total of 16 would
-  # leave the subscriber warming up forever.
-  history = FakeKlineHistory(
-    {("BTCUSDT", "1m"): [rest_kline(T0_MS + i * 60_000) for i in range(3)]}
-  )
-  ingestion, publisher, _ = make_ingestion(
-    FakeKlineStream(), history, BACKFILL_ON_START=True, WARMUP_BARS=16
-  )
-  await ingestion.start()
-  await wait_for(lambda: len(publisher.events) == 3)
-  await ingestion.stop()
-
-  assert warmup_series(publisher) == [(True, 1, 3), (True, 2, 3), (True, 3, 3)]
-
-
-async def test_a_repeated_row_does_not_shorten_the_warmup_series():
-  # A response that repeats an open time must not leave the series one short of
-  # the warmup_total it announces.
+async def test_history_asks_one_row_past_the_count_and_drops_the_forming_bar():
+  now_open_ms = int(utcnow().timestamp() * 1000) // 60_000 * 60_000
   history = FakeKlineHistory(
     {
       ("BTCUSDT", "1m"): [
-        rest_kline(T0_MS),
-        rest_kline(T0_MS),
-        rest_kline(T0_MS + 60_000),
+        rest_kline(now_open_ms - 120_000),
+        rest_kline(now_open_ms - 60_000),
+        # Binance's newest row is the bar still forming.
+        rest_kline(now_open_ms),
       ]
     }
   )
-  ingestion, publisher, _ = make_ingestion(
-    FakeKlineStream(), history, BACKFILL_ON_START=True, WARMUP_BARS=16
-  )
-  await ingestion.start()
-  await wait_for(lambda: len(publisher.events) == 2)
-  await ingestion.stop()
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
 
-  assert warmup_series(publisher) == [(True, 1, 2), (True, 2, 2)]
+  _, bars = await ingestion.fetch_history("BTCUSDT", M1, 2)
 
-
-async def test_a_broken_row_leaves_the_whole_warmup_window_unpublished():
-  # Same rule as MT5: a series that stops short of its own warmup_total strands
-  # a subscriber that ends its warm-up on index == total.
-  broken = rest_kline(T0_MS + 60_000)
-  broken[2] = "0"  # high below the open — the schema rejects the bar
-  history = FakeKlineHistory(
-    {("BTCUSDT", "1m"): [rest_kline(T0_MS), broken, rest_kline(T0_MS + 120_000)]}
-  )
-  stream = FakeKlineStream([kline(T0_MS + 180_000)])
-  ingestion, publisher, _ = make_ingestion(
-    stream, history, BACKFILL_ON_START=True, WARMUP_BARS=16
-  )
-  await ingestion.start()
-  # The live socket is unaffected — a REST failure must never cost it bars.
-  await wait_for(lambda: len(publisher.events) == 1)
-  await ingestion.stop()
-
-  assert warmup_series(publisher) == [(False, None, None)]
+  assert history.calls == [("BTCUSDT", "1m", 3)]
+  assert [int(bar.open_time.timestamp() * 1000) for bar in bars] == [
+    now_open_ms - 120_000,
+    now_open_ms - 60_000,
+  ]
 
 
-async def test_backfill_never_exceeds_warmup_bars():
-  history = FakeKlineHistory(
-    {("BTCUSDT", "1m"): [rest_kline(T0_MS + i * 60_000) for i in range(6)]}
-  )
-  ingestion, publisher, _ = make_ingestion(
-    FakeKlineStream(), history, BACKFILL_ON_START=True, WARMUP_BARS=2
-  )
-  await ingestion.start()
-  await wait_for(lambda: len(publisher.events) == 2)
-  await ingestion.stop()
+async def test_history_never_returns_more_than_was_asked_for():
+  rows = [rest_kline(T0_MS + step * 60_000) for step in range(6)]
+  history = FakeKlineHistory({("BTCUSDT", "1m"): rows})
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
 
-  # The newest two closed bars, not the whole response.
-  opens = [int(e.bar.open_time.timestamp()) for e in publisher.events]
-  assert opens == [(T0_MS + 4 * 60_000) // 1000, (T0_MS + 5 * 60_000) // 1000]
+  _, bars = await ingestion.fetch_history("BTCUSDT", M1, 2)
+
+  assert [int(bar.open_time.timestamp() * 1000) for bar in bars] == [
+    T0_MS + 4 * 60_000,
+    T0_MS + 5 * 60_000,
+  ]
 
 
-async def test_a_backfilled_bar_the_socket_repeats_is_published_once():
+async def test_history_is_capped_at_one_klines_request():
   history = FakeKlineHistory({("BTCUSDT", "1m"): [rest_kline(T0_MS)]})
-  # The socket replays the same close, then delivers the next one.
-  stream = FakeKlineStream([kline(T0_MS), kline(T0_MS + 60_000)])
-  ingestion, publisher, _ = make_ingestion(stream, history, BACKFILL_ON_START=True)
-  await ingestion.start()
-  await wait_for(lambda: len(publisher.events) == 2)
-  await ingestion.stop()
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
 
-  opens = [int(e.bar.open_time.timestamp()) for e in publisher.events]
-  assert opens == [T0_MS // 1000, (T0_MS + 60_000) // 1000]
+  await ingestion.fetch_history("BTCUSDT", M1, 5000)
+
+  assert history.calls == [("BTCUSDT", "1m", 1000)]
 
 
-async def test_backfill_does_not_repeat_on_reconnect():
-  history = FakeKlineHistory({("BTCUSDT", "1m"): [rest_kline(T0_MS)]})
-  stream = FakeKlineStream(
-    [
-      kline(T0_MS + 60_000),
-      GatewayConnectionError("socket closed"),
-      kline(T0_MS + 120_000),
-    ]
+async def test_history_may_ask_for_a_timeframe_that_is_not_on_the_socket():
+  history = FakeKlineHistory(
+    {("BTCUSDT", "15m"): [rest_kline(T0_MS, interval_ms=900_000)]}
   )
-  ingestion, publisher, _ = make_ingestion(stream, history, BACKFILL_ON_START=True)
-  await ingestion.start()
-  await wait_for(lambda: len(publisher.events) == 3)
-  await wait_for(lambda: len(stream.opened) >= 2)
-  await ingestion.stop()
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
 
-  # The stream was fed by the socket, so the reconnect re-reads nothing: one
-  # REST call in total, not one per dial.
-  assert len(history.calls) == 1
+  _, bars = await ingestion.fetch_history("BTCUSDT", Timeframe.M15, 1)
+
+  assert bars[0].close_time - bars[0].open_time == Timeframe.M15.delta
 
 
-async def test_a_failed_backfill_does_not_cost_the_socket():
+async def test_history_collapses_a_row_binance_repeats():
+  history = FakeKlineHistory(
+    {
+      ("BTCUSDT", "1m"): [
+        rest_kline(T0_MS - 60_000),
+        rest_kline(T0_MS),
+        rest_kline(T0_MS),
+      ]
+    }
+  )
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
+
+  _, bars = await ingestion.fetch_history("BTCUSDT", M1, 5)
+  assert len(bars) == 2
+
+
+async def test_history_for_an_unconfigured_symbol_is_refused():
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), FakeKlineHistory())
+  with pytest.raises(UnknownSymbolError, match="ETHUSDT"):
+    await ingestion.fetch_history("ETHUSDT", M1, 5)
+
+
+async def test_a_failed_klines_request_is_unavailable_and_the_socket_carries_on():
   history = FakeKlineHistory()
   history.error = GatewayConnectionError("429 Too Many Requests")
-  stream = FakeKlineStream([kline(T0_MS)])
-  ingestion, publisher, _ = make_ingestion(stream, history, BACKFILL_ON_START=True)
+  stream = FakeKlineStream()
+  ingestion, publisher, _ = make_ingestion(stream, history)
   await ingestion.start()
+  await wait_for(lambda: stream.opened)
+
+  with pytest.raises(HistoryUnavailableError, match="429"):
+    await ingestion.fetch_history("BTCUSDT", M1, 5)
+
+  stream.push(kline(T0_MS))
   await wait_for(lambda: len(publisher.events) == 1)
   await wait_for(lambda: ingestion.status is GatewayStatusEnum.RUNNING)
   await ingestion.stop()
 
-  assert int(publisher.events[0].bar.open_time.timestamp()) == T0_MS // 1000
 
-
-async def test_a_stream_with_no_closed_history_publishes_nothing():
-  # Only the bar still forming came back.
+async def test_history_with_only_the_forming_bar_is_unavailable():
   now_open_ms = int(utcnow().timestamp() * 1000) // 60_000 * 60_000
   history = FakeKlineHistory({("BTCUSDT", "1m"): [rest_kline(now_open_ms)]})
-  ingestion, publisher, _ = make_ingestion(
-    FakeKlineStream(), history, BACKFILL_ON_START=True
-  )
-  await ingestion.start()
-  await wait_for(lambda: history.calls)
-  await ingestion.stop()
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
 
-  assert publisher.events == []
+  with pytest.raises(HistoryUnavailableError, match="no closed bar"):
+    await ingestion.fetch_history("BTCUSDT", M1, 5)

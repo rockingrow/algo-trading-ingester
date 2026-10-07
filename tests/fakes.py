@@ -21,20 +21,6 @@ class FakePublisher:
     self.events.append(event)
 
 
-def warmup_series(
-  publisher: FakePublisher,
-) -> list[tuple[bool, int | None, int | None]]:
-  """``(warmup_bar, warmup_index, warmup_total)`` per event, in publish order.
-
-  The order is the assertion: a warm-up window reaches the subscriber as a
-  contiguous ``1 .. total`` series, oldest first, before any live bar.
-  """
-  return [
-    (event.warmup_bar, event.warmup_index, event.warmup_total)
-    for event in publisher.events
-  ]
-
-
 class FakeNotifier:
   def __init__(self) -> None:
     self.messages: list[str] = []
@@ -211,6 +197,9 @@ class FakeTerminal:
     self.initialize_ok = True
     self.initialize_calls = 0
     self.shutdown_calls = 0
+    #: ``(thread name, count)`` per rates read — which thread touched the
+    #: terminal, and how many bars it asked for.
+    self.reads: list[tuple[str, int]] = []
 
   def set_rates(self, symbol: str, timeframe: Timeframe, records: list[dict]) -> None:
     with self._lock:
@@ -248,6 +237,7 @@ class FakeTerminal:
     self, symbol: str, timeframe: Timeframe, start_pos: int, count: int
   ) -> list[dict[str, Any]] | None:
     with self._lock:
+      self.reads.append((threading.current_thread().name, count))
       records = self.rates.get((symbol, timeframe))
       if records is None:
         return None

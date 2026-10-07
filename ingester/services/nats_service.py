@@ -1,10 +1,11 @@
 """
-ingester/services/nats_service.py — One-way NATS publishing.
+ingester/services/nats_service.py — The NATS connection and bar publishing.
 
 :class:`NatsConnection` owns the connection lifecycle and its callbacks;
 :class:`NatsPublisher` implements :class:`~ingester.interfaces.EventPublisher`
-on top of it. The ingester only ever *publishes* — it holds no subscriptions and
-expects no replies.
+on top of it. Publishing is one way and expects no reply. The same connection
+also carries the one subscription the ingester holds — history requests, in
+:mod:`ingester.services.history_service`.
 
 Two delivery modes, chosen by ``NATS_JETSTREAM_ENABLED``:
 
@@ -19,6 +20,7 @@ Two delivery modes, chosen by ``NATS_JETSTREAM_ENABLED``:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import nats as nats_lib
@@ -49,6 +51,12 @@ class NatsConnection:
     # Set while we close on purpose, so the drain's own disconnect callback is
     # not reported to operators as an outage.
     self._closing = False
+    #: Called after every re-established connection, in registration order.
+    self._reconnect_hooks: list[Callable[[], Awaitable[None]]] = []
+
+  def on_reconnect(self, hook: Callable[[], Awaitable[None]]) -> None:
+    """Run *hook* each time the connection comes back after a drop."""
+    self._reconnect_hooks.append(hook)
 
   @property
   def config(self) -> NatsSettings:
@@ -147,7 +155,7 @@ class NatsConnection:
     A stream is never reconfigured once it exists, so both of these fail
     quietly long after the change that caused them: a stream whose subjects
     miss our prefix rejects every publish, and one whose duplicate window is
-    shorter than a start-up backfill lets replayed bars through twice.
+    shorter than a reconnect's recovery read lets a re-read bar through twice.
     """
     config = getattr(info, "config", None)
     if config is None:
@@ -170,8 +178,8 @@ class NatsConnection:
     if window is not None and window < wanted_window:
       log.warning(
         "JetStream stream %s de-duplicates over %.0fs, less than the "
-        "configured %.0fs; a restart that backfills further back than that "
-        "will republish bars. Recreate the stream to widen the window.",
+        "configured %.0fs; a bar re-read after a longer outage than that is "
+        "stored twice. Recreate the stream to widen the window.",
         self._config.stream_name,
         window,
         wanted_window,
@@ -192,6 +200,12 @@ class NatsConnection:
     await self._notifier.send_message(
       messages.nats_reconnected(url=self._config.url, instance_id=self._instance_id)
     )
+    for hook in self._reconnect_hooks:
+      try:
+        await hook()
+      except Exception:
+        # One hook failing must not cost the others, nor nats-py its callback.
+        log.exception("A NATS reconnect hook failed")
 
   async def _on_error(self, exc: Exception) -> None:
     log.error("NATS error: %s", exc)
@@ -228,13 +242,34 @@ class NatsPublisher:
       # timeout; fail fast instead so the error is reported immediately.
       if not self.is_connected:
         raise ConnectionError(f"NATS ({self._config.url}) is not connected")
-      await self._connection.js.publish(
+      ack = await self._connection.js.publish(
         subject,
         data,
         timeout=self._config.PUBLISH_TIMEOUT,
         headers={js_api.Header.MSG_ID.value: event.event_id},
       )
+      if ack.duplicate:
+        # The stream acknowledged the publish and stored nothing: this
+        # ``Nats-Msg-Id`` was already seen inside the duplicate window. No
+        # JetStream consumer will ever be handed this message, so it must not
+        # read as "published" in the log.
+        log.warning(
+          "JetStream DROPPED %s as a duplicate → %s (stream=%s, kept seq=%s) — "
+          "no consumer receives this message",
+          event.event_id,
+          subject,
+          ack.stream,
+          ack.seq,
+        )
+        return
+      log.info(
+        "Published %s → %s (stream=%s seq=%s)",
+        event.event_id,
+        subject,
+        ack.stream,
+        ack.seq,
+      )
     else:
       await self._connection.nc.publish(subject, data)
-    log.info("Published %s → %s", event.event_id, subject)
+      log.info("Published %s → %s", event.event_id, subject)
     log.debug("Published payload %s: %s", event.event_id, data.decode())

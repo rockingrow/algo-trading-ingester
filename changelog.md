@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Changed — history is asked for, not pushed at start-up (breaking)
+
+- **A gateway publishes nothing at start-up.** The first read only records the
+  latest closed bar; `backfill_on_start` is gone from `[mt5]` and `[binance]`,
+  and with it the warm-up window. A subscriber that needs the bars from before
+  it was listening sends a **history request** and gets them in one reply — it
+  decides which series and how many bars, and the ingester holds no warm-up
+  setting.
+- **New: `<rpc_prefix>.history.<gateway>.<symbol>.<timeframe>`**, core NATS
+  request/reply. Body `{symbol, timeframe, count}`; reply `{status, bars, …}`
+  with the same `bar` objects a `bar.closed` event carries, closed bars only,
+  oldest first. Contract in `ingester/schemas/history_schema.py`, samples in
+  `examples/nats/history.*.json`. Refusals are answered too, with a `code` that
+  says whether asking again can help.
+- **New: `<rpc_prefix>.online.<gateway>`**, an announcement published once a
+  gateway is answering requests and again after every NATS reconnect
+  (`examples/nats/ingester.online.mt5.json`). A subscriber starts without the
+  ingester, asks nothing on a timer, and reacts to this by checking its
+  windows and requesting the short ones.
+- **`warmup_bar`, `warmup_index` and `warmup_total` are gone from
+  `bar.closed`.** Every message on that subject is a close. `SCHEMA_VERSION`
+  stays `1.0.0`: a decoder that read a missing `warmup_bar` as `false` — which
+  the contract required — reads the same bars it always did. The two entries
+  that introduced those fields are dropped from this changelog rather than
+  listed and then undone: nothing was released carrying them.
+- **Why.** A window sent as numbered events has to be reassembled, and JetStream
+  de-duplicates on `event_id`: a restart inside `NATS_DUPLICATE_WINDOW_SECONDS`
+  had every warm-up bar dropped by the stream, and a restart after it lost the
+  newest ones — including the bar that ends the window, which left the
+  subscriber buffering a batch that never completed. It also triggered on the
+  wrong side: the ingester only knows when *it* restarted, not when the
+  subscriber's window is short.
+- **Settings.** `[mt5] warmup_bars` is renamed **`recovery_bars`** — it only
+  ever sized the read that recovers bars after a terminal disconnect.
+  `[binance] warmup_bars` is removed. A market file still carrying
+  `backfill_on_start` or `warmup_bars` is refused at start-up as an unknown
+  key. New in `.env`: `NATS_RPC_SUBJECT_PREFIX` (blank =
+  `<NATS_SUBJECT_PREFIX>_RPC`; refused when it sits under
+  `NATS_SUBJECT_PREFIX`, where the stream would capture requests),
+  `NATS_HISTORY_MAX_BARS` (5000), `NATS_HISTORY_TIMEOUT` (20s).
+- **No new network exposure.** The subscription rides the connection the
+  publisher already holds; nothing inbound is opened. Each gateway joins the
+  queue group `<rpc_prefix>-history-<gateway>`.
+- **MT5 history is read on the gateway thread**, between two polls
+  (`ThreadedIngestion._call_on_thread`), and is served without waiting out the
+  poll interval. `/status` gains `history_served` / `history_refused`.
+- **The JetStream ack is read.** A publish the stream drops as a duplicate is
+  logged as `JetStream DROPPED … — no consumer receives this message` instead
+  of `Published`.
+
 ### Configuration — the payload schema version is a setting
 
 - `SCHEMA_VERSION` moves out of `market_event_schema.py` into `.env`
@@ -79,17 +129,19 @@
   | `MT5_TIMEFRAMES` | `[mt5] timeframes` |
   | `MT5_SERVER_TIMEZONE` | `[mt5] server_timezone` |
   | `MT5_POLL_INTERVAL_SECONDS` | `[mt5] poll_interval_seconds` |
-  | `MT5_CATCHUP_BARS` | `[mt5] warmup_bars` (renamed) |
-  | `MT5_BACKFILL_ON_START` | `[mt5] backfill_on_start` |
+  | `MT5_CATCHUP_BARS` | `[mt5] recovery_bars` (renamed twice — see the top entry) |
+  | `MT5_BACKFILL_ON_START` | removed — see the top entry |
   | `MT5_RECONNECT_INTERVAL_SECONDS` | `[mt5] reconnect_interval_seconds` |
 
   `MT5_TERMINAL_PATH`, `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and
   `MT5_TIMEOUT_MS` **stay in `.env`**: they are secrets and host paths, and the
   market files are meant to be readable and diffable.
-- **`catchup_bars` is now `warmup_bars`**, in both `[mt5]` and `[binance]`.
-  The old key is refused as an unknown key, so a market file still carrying it
-  is reported as **Ingester Degraded** — rename it in your own
-  `config/*.toml` after pulling. The published payload is unaffected: it is
+- **`catchup_bars` is now `recovery_bars`** in `[mt5]`, and is gone from
+  `[binance]`. (It was renamed to `warmup_bars` first; the top entry renamed it
+  again, once it was clear the key only ever sized an outage re-read.) The old
+  key is refused as an unknown key, so a market file still carrying it is
+  reported as **Ingester Degraded** — rename it in your own `config/*.toml`
+  after pulling. The published payload is unaffected: it is
   how many closed bars a read covers, never a field on the wire.
 - `config/*.toml` is git-ignored; `config/forex.example.toml` and
   `config/crypto.example.toml` are the committed templates. Copy them after
@@ -97,70 +149,6 @@
 
 The published payload is unchanged — `SCHEMA_VERSION` stays `1.0.0` and
 `qte-ingest` needs no change for this.
-
-### Added — the warm-up window is numbered
-
-- **`warmup_index` and `warmup_total`** are two new top-level integers on
-  `bar.closed`, set only on a bar whose `warmup_bar` is `true` and `null`
-  otherwise. They number the start-up window `1 … warmup_total`, oldest first,
-  so `qte-ingest` can end its warm-up on exactly one message — the one where
-  `warmup_index == warmup_total` — instead of guessing whether more history is
-  still coming. Everything published after it on that subject is live.
-- **Order is part of the contract now.** A gateway publishes the whole warm-up
-  window before any live bar, oldest first and with no gaps in the index. That
-  already held — one publish queue per gateway, drained one event at a time —
-  and is now stated in the README and pinned by tests in
-  `tests/test_mt5_ingestion.py` and `tests/test_binance_ingestion.py`.
-- **`warmup_total` is the window the venue actually returned**, bounded by the
-  market file's `warmup_bars` rather than always equal to it. A recently listed
-  symbol or a broker with a thin archive hands back fewer bars, and a
-  subscriber waiting for `150` of `150` from a broker that only has `143` would
-  wait forever. Both gateways also de-duplicate the window by open time before
-  numbering it, so the series can never be shorter than the `warmup_total` it
-  announces.
-- The series is **per `(symbol, timeframe)`**, which is per subject: warm-up
-  ends per subject, not once for the gateway.
-- **A window is all-or-nothing**: both gateways now convert the whole window
-  before publishing the first bar, so a record the schema rejects half-way
-  through publishes nothing and the next poll or reconnect retries the window,
-  rather than emitting a series that stops short of its own `warmup_total`.
-- **A window is not guaranteed to arrive**, so do not block on one forever:
-  there is none with `backfill_on_start = false`, none for a stream whose
-  history cannot be read, and none when the Binance REST backfill fails. Live
-  bars still flow in all three cases. And with core NATS a failed publish is
-  logged and counted rather than retried — gate on
-  `warmup_index == warmup_total` only with JetStream enabled.
-- Neither field is part of `event_id`, for the reason `warmup_bar` is not and
-  one more: the numbers describe the window, so the same bar is `150` of `150`
-  for one start-up and `1` of `150` for the next.
-- Both fields are additive and default to `null`, so `SCHEMA_VERSION` stays
-  `1.0.0` and a subscriber that ignores them keeps decoding every message.
-  `examples/nats/bar.closed.mt5.warmup.json` is a new sample showing the bar
-  that ends a 150-bar window; the two live samples gained
-  `"warmup_index": null, "warmup_total": null`.
-- With `backfill_on_start = false` there is no warm-up window, so nothing
-  carries the numbers. No configuration changed.
-
-### Added — `warmup_bar` on every `bar.closed` payload
-
-- **`warmup_bar`** is a new top-level boolean on `bar.closed`. It is `true` only
-  on the bars a process reads back at start-up — the MT5 first poll under
-  `backfill_on_start`, and the Binance REST backfill — and `false` on everything
-  the live feed delivers, including bars recovered after a reconnect, which are
-  late rather than warm-up. `qte-ingest` can warm indicators on a `true` bar
-  without acting on it.
-- The field is additive and defaults to `false`, so `SCHEMA_VERSION` stays
-  `1.0.0` and a subscriber that ignores it keeps decoding every message. A
-  payload without the field is a `false`.
-- It is deliberately **not** part of `event_id`: the same bar can arrive live
-  from one process and as warm-up from the next, and JetStream keeps whichever
-  landed first — so de-duplicate on `event_id` as before and read `warmup_bar`
-  only to decide whether to act on a bar. Example payloads in `examples/nats/`
-  show a live bar (`"warmup_bar": false`).
-- JetStream de-duplicates only inside `NATS_DUPLICATE_WINDOW_SECONDS` (default
-  120 s), and a warm-up window is usually older than that — 150 bars of M15 is
-  37 hours — so those bars do reach the subscriber again. That is exactly where
-  the flag earns its keep.
 
 ### Added
 
@@ -193,7 +181,9 @@ The published payload is unchanged — `SCHEMA_VERSION` stays `1.0.0` and
 
 ### Added (Binance)
 
-- **`[binance].backfill_on_start` and `[binance].warmup_bars`.** The kline
+- **`[binance].backfill_on_start` and `[binance].warmup_bars`** (both removed
+  again before release — the top entry replaced them with history requests,
+  answered from the same REST endpoint). The kline
   websocket only carries bars that close while it is connected, so the bars
   that closed before start-up were never published. With
   `backfill_on_start = true` the gateway reads the last `warmup_bars` closed
@@ -221,10 +211,11 @@ The published payload is unchanged — `SCHEMA_VERSION` stays `1.0.0` and
   and therefore `event_id` stay the configured name, so the wire contract is
   unchanged and survives a change of broker. `symbol_suffix` settles a tie
   between equally close candidates; a fully spelled name is used verbatim.
-- **`[mt5].backfill_on_start`.** Publishes the closed bars found at start-up
-  instead of only recording them, so a crash no longer silently skips the bars
-  that closed while the process was down. Bounded by `warmup_bars`; pair it
-  with JetStream, which drops the replayed duplicates by `event_id`.
+- **`[mt5].backfill_on_start`** (removed again before release — the top entry
+  replaced it with history requests). Publishes the closed bars found at
+  start-up instead of only recording them, so a crash no longer silently skips
+  the bars that closed while the process was down. Bounded by `warmup_bars`;
+  pair it with JetStream, which drops the replayed duplicates by `event_id`.
 - **Errors in their own Telegram chat.** `TELEGRAM_LOG_ERRORS_ENABLED` mirrors
   every `ERROR` record to `TELEGRAM_LOG_CHAT_IDS` with an optional separate
   bot token, its own queue and a `TELEGRAM_LOG_DEDUP_WINDOW` suppression

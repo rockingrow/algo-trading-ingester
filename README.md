@@ -2,9 +2,12 @@
 
 A market-data gateway for the algo-trading ecosystem. It watches upstream venues
 for **closed bars**, normalises them into **one canonical schema**, and
-publishes them **one way** to NATS for
+publishes each one to NATS for
 [`quant-trading-engine`](https://github.com/rockingrow/quant-trading-engine)'s
-`qte-ingest` to consume. Service status goes to Telegram.
+`qte-ingest` to consume. Bars go **one way**; the only thing it listens for is a
+[history request](#history-requests) — the bars from before a subscriber was
+listening are not pushed, they are asked for and answered in one reply. Service
+status goes to Telegram.
 
 One process runs several **markets** side by side — `SOURCE_MARKET=forex,crypto`
 in `.env`, one `config/<market>.toml` per market:
@@ -143,7 +146,7 @@ Keys below are from the `[mt5]` table of a market file, e.g. `config/forex.toml`
 
 MetaTrader5's Python API has no callbacks, so the MT5 gateway polls from its
 own thread (`mt5-ingestion`). Every `poll_interval_seconds` it reads the newest
-**completed** bars (`copy_rates_from_pos(symbol, tf, 1, warmup_bars)` —
+**completed** bars (`copy_rates_from_pos(symbol, tf, 1, recovery_bars)` —
 position 0 is the bar still forming) and emits every bar newer than the last
 one it emitted.
 
@@ -153,16 +156,20 @@ one it emitted.
   so `event_id` survives a change of broker. A fully spelled `XAUUSDm` is used
   verbatim; `symbol_suffix` settles a tie between, say, `EURUSDm` and
   `EURUSDc`.
-- **Start-up** only records the latest closed bar, so a restart does not
-  re-publish history. With `backfill_on_start = true` it publishes that whole
-  window instead, recovering the bars a crash would otherwise skip — flagged
-  `warmup_bar: true` and numbered `warmup_index` of `warmup_total`, oldest
-  first, so a subscriber knows which bar ends the window. JetStream drops the
-  replayed bars that fall inside its duplicate window; the older ones arrive
-  again, see [Delivery](#-nats-contract).
+- **Start-up** only records the latest closed bar: nothing is published from
+  the first read, so a restart never re-publishes history. The bars a
+  subscriber needs from before it was listening are not pushed — the gateway
+  does not know who is listening or how long their indicator window is. They
+  are [asked for](#history-requests), and answered in one reply.
 - **Gap recovery**: bars that closed during a terminal disconnect are
-  published, oldest first, after reconnecting (up to `warmup_bars`). They are
-  late, not warm-up — only the start-up window carries `warmup_bar: true`.
+  published, oldest first, after reconnecting (up to `recovery_bars`). Bars
+  that closed while the *process* was down are not: the next close is
+  published with a gap before it, and the subscriber fills that gap with a
+  history request.
+- **History** is read on this same thread, between two polls — the MetaTrader5
+  package keeps thread-affine state. Any timeframe MT5 has may be asked for,
+  not only the ones this gateway polls; the symbol must be one it is
+  configured for.
 - **Server time**: MT5 stamps bars in trade-server time. Set `server_timezone`
   so they are converted to real UTC.
 - A close is seen when the next bar opens (its first tick), plus up to one poll
@@ -187,18 +194,10 @@ timeframe and emits the bars Binance marks closed.
   Binance's `T` — which is one millisecond short of the next bar's open. A
   subscriber comparing venues should not have to know that.
 - **Start-up**: the socket only carries bars that close while it is connected,
-  so by default the bars that closed before this process started are not
-  published. With `backfill_on_start = true` the gateway reads the last
-  `warmup_bars` closed bars per stream from the REST endpoint at
-  `klines_url` — after the socket is open, so no bar falls between the two —
-  and publishes them first, giving a subscriber backfill and live bars as one
-  continuous series. Only streams nothing has been published for yet are read,
-  so a reconnect re-reads nothing; a REST failure is logged and skipped rather
-  than costing the live socket. Those bars carry `warmup_bar: true` and their
-  `warmup_index` of `warmup_total`, oldest first; what the socket delivers
-  carries neither. JetStream drops the replayed bars that fall inside
-  its duplicate window; the older ones arrive again, see
-  [Delivery](#-nats-contract).
+  so the bars that closed before this process started are not published. A
+  subscriber that needs them [asks](#history-requests) and is answered from the
+  REST endpoint at `klines_url` — at most 999 closed bars per request,
+  Binance's limit less the bar still forming, in any timeframe Binance has.
 - **De-duplication**: the newest open time emitted per stream is remembered, so
   a reconnect that replays a bar, or a repeated final update, publishes once.
 - **Reconnects**: Binance closes a connection after 24 hours, and a socket that
@@ -231,8 +230,7 @@ Characters NATS reserves are replaced with `_` in the subject token only
 **Payload** — `BarClosedEvent` (`ingester/schemas/market_event_schema.py`), JSON,
 all times UTC. Full examples:
 [`bar.closed.mt5.json`](examples/nats/bar.closed.mt5.json),
-[`bar.closed.binance.json`](examples/nats/bar.closed.binance.json),
-[`bar.closed.mt5.warmup.json`](examples/nats/bar.closed.mt5.warmup.json).
+[`bar.closed.binance.json`](examples/nats/bar.closed.binance.json).
 
 | Field | Meaning |
 | --- | --- |
@@ -241,59 +239,106 @@ all times UTC. Full examples:
 | `event_type` | `bar.closed` |
 | `source` | `gateway`, `market` (the file it was configured in), `ingester_id`, `venue` (MT5 trade server, or the Binance endpoint host) |
 | `emitted_at` | when this process published the bar, UTC — wall-clock, so it is deliberately **not** part of `event_id` |
-| `warmup_bar` | `true` only on the bars this process read back at start-up (the warm-up window); `false` on everything the live feed delivers |
-| `warmup_index` | position of this bar in that window, `1` … `warmup_total`, oldest first; `null` on a live bar |
-| `warmup_total` | bars in that window — `warmup_index == warmup_total` is the last one; `null` on a live bar |
 | `symbol`, `timeframe` | as configured; timeframe ∈ `M1 M5 M15 M30 H1 H4 D1 W1` |
 | `bar` | `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume`, `tick_count`, `quote_volume`, `spread` |
 
 Venue-specific fields are `null` rather than zero when a venue does not have
 them (MT5 has no `quote_volume`, Binance has no `spread`).
 
-`warmup_bar` describes **this delivery**, not the bar: the same bar can reach a
-subscriber live from one process and again as warm-up from the next, and with
-JetStream the copy that lands first is the one kept — so de-duplicate on
-`event_id` as before and read `warmup_bar` only to decide whether to act on a
-bar. A payload without the field is a `false`. None of the three warm-up fields
-is part of `event_id`, for the same reason and one more: the numbers describe
-the window, so the same bar is `150` of `150` for one start-up and `1` of `150`
-for the next.
+Every message on this subject is a close: a bar the venue has just finished,
+or one a reconnect recovered late. History is never replayed onto it, so there
+is nothing on the wire to tell the two apart and no warm-up fields to read.
 
-**Warm-up order** — a gateway publishes the whole warm-up window **before** any
-live bar, oldest first, numbered `1` … `warmup_total` with no gaps. So a
-subscriber ends its warm-up on exactly one message, the one where
-`warmup_index == warmup_total`, and everything after it on that subject is live
-(`warmup_bar: false`). The order is guaranteed: one publish queue per gateway,
-drained one event at a time.
+### History requests
+
+A subscriber that needs the bars from before it was listening asks for them.
+**The subscriber decides which series and how many bars; the ingester holds no
+warm-up setting.**
+
+**Subject** — `<rpc_prefix>.history.<gateway>.<symbol>.<timeframe>`, core NATS
+request/reply:
+
+```text
+INGEST_RPC.history.mt5.XAUUSD.M15
+```
+
+`rpc_prefix` is `NATS_RPC_SUBJECT_PREFIX`, or `<NATS_SUBJECT_PREFIX>_RPC` when
+that is blank. **It may not sit under `NATS_SUBJECT_PREFIX`** — the JetStream
+stream listens on `<NATS_SUBJECT_PREFIX>.>` and would store every request as
+market data and answer it with its own acknowledgement before the ingester
+could. A prefix that does is refused at start-up.
+
+**Request** — `HistoryRequest` (`ingester/schemas/history_schema.py`),
+[`history.request.mt5.json`](examples/nats/history.request.mt5.json):
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | the caller's; not checked today |
+| `request_id` | free text, echoed on the reply and in both logs |
+| `symbol` | the bare name from the market file (`XAUUSD`), matched without regard to case |
+| `timeframe` | any of `M1 M5 M15 M30 H1 H4 D1 W1` the venue has — not only the ones this gateway publishes |
+| `count` | how many of the newest **closed** bars to return, `>= 1` |
+
+**Reply** — one `HistoryReply`,
+[`history.reply.mt5.json`](examples/nats/history.reply.mt5.json) /
+[`history.reply.error.json`](examples/nats/history.reply.error.json):
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `ok` or `error` |
+| `request_id`, `symbol`, `timeframe`, `requested` | the request, echoed — `symbol` as the market file spells it |
+| `source` | same object as on a `bar.closed` event |
+| `bars` | closed bars, oldest first, each the same `bar` object a `bar.closed` event carries — never the bar still forming |
+| `truncated` | `true` when bars were held back: `count` was over `NATS_HISTORY_MAX_BARS`, or the reply would not fit in one NATS message. Fewer bars because the venue has no more history is **not** truncation |
+| `error` | `{code, message}` on `status: "error"`, otherwise `null` |
+
+| `error.code` | Meaning | Ask again? |
+| --- | --- | --- |
+| `unknown_symbol` | the symbol is not configured for this gateway | no |
+| `bad_request` | the body is not a request this version reads | no |
+| `unavailable` | the venue is disconnected, or returned nothing | yes |
+| `timeout` | the venue did not answer within `NATS_HISTORY_TIMEOUT` | yes |
+| `internal` | a bug here; the log has the traceback | yes |
+
+**Announcement** — `<rpc_prefix>.online.<gateway>`, core NATS, an
+`OnlineAnnouncement`
+([`ingester.online.mt5.json`](examples/nats/ingester.online.mt5.json)):
+
+```text
+INGEST_RPC.online.mt5
+```
+
+Published once the gateway's request subscription is in place, and again after
+every NATS reconnect (`reason`: `started` / `reconnected`), carrying `source`
+and the `symbols` / `timeframes` it is configured for. It is how a subscriber
+runs independently of the ingester: it starts on whatever it holds, asks
+nothing on a timer, and when this arrives checks its windows and requests the
+short ones. The announcement is flushed only after the subscription is, so a
+request it provokes always finds a responder. It is not persisted — a
+subscriber that was not listening learns the same thing by asking, since NATS
+answers *no responders* at once when no ingester is subscribed.
 
 What the ingester guarantees, and what it does not:
 
-- **The series is per `(symbol, timeframe)`**, which is per subject. With
-  `symbols = ["XAUUSD", "USOIL"]` each gets its own `1` … `total`, so warm-up
-  ends per subject rather than once for the gateway. The two series do not mix
-  on one subject, but they do interleave in time.
-- **`warmup_total` is the window the venue actually returned**, bounded by the
-  market file's `warmup_bars` and shorter when there is less history than that
-  — a recently listed symbol, a broker with a thin archive. It is deliberately
-  not the configured number: a subscriber waiting for `150` of `150` from a
-  broker that only has `143` bars would wait forever.
-- **A window is all-or-nothing.** Every bar is converted before the first is
-  published, so a record the schema rejects half-way through publishes nothing
-  instead of a series that stops short of the `warmup_total` it announced. The
-  stream keeps its place, so the next poll (MT5) or reconnect (Binance) retries
-  the whole window.
-- **A window is not guaranteed to arrive at all**, so do not block on one
-  forever. There is none with `backfill_on_start = false`, none for a stream
-  whose history cannot be read, and none for a Binance stream whose REST
-  backfill fails — in each case live bars still flow, carrying
-  `warmup_bar: false` and no numbers. Read that as *no warm-up data*, not
-  *warm-up still pending*.
-- **Delivery is only as reliable as the transport.** The numbering is
-  contiguous as published — one queue per gateway, drained one event at a time
-  — but with core NATS a publish that fails is logged, counted in `/status` as
-  `failed`, and not retried, which can take a bar out of the series. Use
-  JetStream (`NATS_JETSTREAM_ENABLED=true`) if the subscriber gates on
-  `warmup_index == warmup_total`.
+- **One reply, whole or absent.** There is no series to reassemble and no
+  message of it that can be lost on its own. A caller that hears nothing
+  retries the request.
+- **Every request with a reply subject is answered**, the refusals included,
+  so "the ingester said no" never looks like "the ingester is not running".
+  With no ingester subscribed, NATS itself answers *no responders* at once.
+- **Nothing inbound is opened.** The subscription rides the connection this
+  process already dialled to publish; a request travels back down it.
+- **One ingester answers.** Each gateway subscribes in the queue group
+  `<rpc_prefix>-history-<gateway>`, so a fail-over pair answers a request once
+  between them.
+- **A reply always fits one message.** When it would exceed the server's
+  `max_payload` the oldest bars are dropped and `truncated` is set — a window
+  is read from its newest end.
+- **Requests are served one at a time per gateway**, in arrival order, and for
+  MT5 between two polls. A request never delays a live bar by more than one
+  read of the terminal.
+- **Not persisted.** Requests are core NATS even when bars go to JetStream; a
+  request sent while the ingester is down is simply not answered.
 
 **Delivery** — core NATS by default (fire-and-forget). With
 `NATS_JETSTREAM_ENABLED=true`, bars are persisted on a stream named after
@@ -305,14 +350,12 @@ every market: `market` and `gateway` tell a subscriber what it is looking at,
 so nothing downstream branches per venue.
 
 De-duplication only reaches back `NATS_DUPLICATE_WINDOW_SECONDS` (default
-`120`). A warm-up window is usually older than that — 150 bars of M15 is 37
-hours — so a restart does **not** silently collapse into the bars already
-published: those messages arrive again, carrying `warmup_bar: true` and their
-position in the new window. Either
-raise the window to cover the span `backfill_on_start` can replay (it is fixed
-when the stream is created and never reconfigured), or let the subscriber use
-`warmup_bar` and its own `event_id` bookkeeping. Retention is
-`NATS_STREAM_MAX_AGE_SECONDS`, 7 days by default.
+`120`). The one time a gateway re-reads bars it may already have published is
+after a venue outage, and how far back that goes is `recovery_bars` × the
+timeframe — size the window to cover it (it is fixed when the stream is created
+and never reconfigured), or a recovered bar is stored twice and the subscriber
+de-duplicates on `event_id`. Retention is `NATS_STREAM_MAX_AGE_SECONDS`, 7 days
+by default.
 
 ---
 
@@ -452,8 +495,7 @@ symbol_suffix = ""               # "m" to force Exness naming
 timeframes = ["M1", "M15", "H1"]
 server_timezone = "Europe/Athens"
 poll_interval_seconds = 1.0
-warmup_bars = 5
-backfill_on_start = false
+recovery_bars = 5                # bars a terminal reconnect can recover
 reconnect_interval_seconds = 5.0
 ```
 
@@ -464,9 +506,7 @@ enable = true
 symbols = ["BTCUSDT", "ETHUSDT"]
 timeframes = ["M1", "M15", "H1"]
 ws_url = "wss://stream.binance.com:9443/stream"
-backfill_on_start = true
-warmup_bars = 16                # only used by the backfill; max 1000
-klines_url = "https://api.binance.com/api/v3/klines"
+klines_url = "https://api.binance.com/api/v3/klines"   # history requests are answered from here
 http_timeout_seconds = 10.0
 reconnect_interval_seconds = 5.0
 ping_interval_seconds = 20.0
@@ -518,12 +558,13 @@ A new venue needs only its own business logic. Take Kraken as the example:
    - an asyncio websocket: subclass `AsyncStreamIngestion` and implement
      `connect`, `receive`, `handle`, `disconnect`, like Binance; `handle`
      calls `self.emit_bar(symbol, timeframe, dto.to_bar(timeframe))` for each
-     closed bar — from a start-up backfill path pass `warmup_bar=True` with
-     `warmup_index=` / `warmup_total=`, numbering the window `1` … `total`
-     oldest first, so a subscriber can tell warm-up from a live close and see
-     where the window ends. The schema rejects a half-numbered series;
+     closed bar. Publish nothing at start-up: history is asked for, so
+     implement `_read_history(symbol, timeframe, count)` to return the newest
+     closed bars from the venue's REST endpoint instead;
    - a blocking SDK: subclass `ThreadedIngestion` and implement `connect`,
-     `poll`, `disconnect`, like MT5.
+     `poll`, `disconnect`, like MT5. Its `_read_history` hands the read to the
+     gateway thread with `self._call_on_thread(...)` — never call a
+     thread-affine SDK from the event loop.
    Guard each bar with `self._is_new_bar(...)` / `self._remember_bar(...)` so
    a replayed bar is emitted once. Raise `GatewayConnectionError` when the
    venue drops; use

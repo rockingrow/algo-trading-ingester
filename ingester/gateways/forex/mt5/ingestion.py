@@ -12,15 +12,16 @@ emitted.
   this broker calls it (Exness: ``XAUUSDm``). Only the MetaTrader5 calls use the
   broker's name — the published ``symbol`` stays the configured one.
 * **Start-up**: the first read only records the latest closed bar; nothing is
-  emitted, so a restart never re-publishes history. With
-  ``backfill_on_start`` it publishes that whole window instead, recovering
-  the bars a crash skipped — flagged ``warmup_bar`` and numbered
-  ``warmup_index`` of ``warmup_total``, oldest first, so a subscriber can warm
-  indicators on them without acting on them and knows which one ends the
-  window.
-* **Gap recovery**: each read fetches ``warmup_bars`` bars, so bars that
+  emitted, so a restart never re-publishes history. The bars a subscriber
+  needs from before that are not this gateway's to push — it does not know who
+  is listening or how long their indicator window is. They are asked for
+  (:meth:`Mt5Ingestion._read_history`) and answered in one reply.
+* **Gap recovery**: each read fetches ``recovery_bars`` bars, so bars that
   closed while the terminal was disconnected are still published, oldest
-  first. They are late rather than warm-up, so they are not flagged.
+  first, once it reconnects.
+* **History**: a request is served on this gateway's own thread, between two
+  polls, because the MetaTrader5 package keeps thread-affine global state. It
+  reads from position 1, like the poll — position 0 is still forming.
 * **Timing**: MT5 opens a new bar on its first tick, so a close is seen on the
   first tick of the next bar plus up to one ``poll_interval_seconds``.
 
@@ -31,13 +32,18 @@ core's job (:class:`~ingester.core.ingestion.ThreadedIngestion`).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
-from ingester.core.errors import GatewayConnectionError, SymbolResolutionError
+from ingester.core.errors import (
+  GatewayConnectionError,
+  HistoryUnavailableError,
+  SymbolResolutionError,
+)
 from ingester.core.ingestion import StreamKey, ThreadedIngestion
 from ingester.gateways.forex.mt5.dto import Mt5RateDTO
 from ingester.gateways.forex.mt5.symbols import resolve_symbol
-from ingester.gateways.forex.mt5.terminal import Mt5Terminal
+from ingester.gateways.forex.mt5.terminal import Mt5Terminal, RateRecord
 from ingester.logger import get_logger
 from ingester.schemas.enums import GatewayEnum, Timeframe
 from ingester.schemas.market_event_schema import Bar
@@ -61,8 +67,8 @@ class Mt5Ingestion(ThreadedIngestion):
     self._mt5_config = config
     self._terminal = terminal
     # The newest bar already emitted per stream is remembered by the core, as a
-    # server-clock epoch; it survives reconnects, so the warm-up read knows
-    # where it left off.
+    # server-clock epoch; it survives reconnects, so the first read after one
+    # knows where it left off.
     # Streams currently returning no data — warned about once, not every poll.
     self._silent: set[StreamKey] = set()
     # Configured symbol → the name this broker actually sells it under.
@@ -157,7 +163,7 @@ class Mt5Ingestion(ThreadedIngestion):
   def _poll_stream(self, symbol: str, broker_symbol: str, timeframe: Timeframe) -> None:
     key = (symbol, timeframe)
     records = self._terminal.copy_rates_from_pos(
-      broker_symbol, timeframe, 1, self._mt5_config.WARMUP_BARS
+      broker_symbol, timeframe, 1, self._mt5_config.RECOVERY_BARS
     )
     if not records:
       if key not in self._silent:
@@ -176,88 +182,82 @@ class Mt5Ingestion(ThreadedIngestion):
 
     log.debug("MT5 raw %s %s: %s", symbol, timeframe.value, records)
 
-    # One bar per open time, oldest first. A window that repeated a bar would
-    # make the warm-up series below shorter than its own ``warmup_total``, and
-    # the subscriber waits for that number.
-    by_time = {
-      dto.time: dto
-      for dto in (
-        Mt5RateDTO.from_record(r, self._mt5_config.SERVER_TIMEZONE) for r in records
-      )
-    }
-    rates = [by_time[open_mark] for open_mark in sorted(by_time)]
+    rates = self._rates(records)
 
     if self._open_mark(symbol, timeframe) is None:
-      if not self._mt5_config.BACKFILL_ON_START:
-        self._remember_bar(symbol, timeframe, rates[-1].time)
-        log.info(
-          "MT5 %s %s primed at bar %s",
-          symbol,
-          timeframe.value,
-          rates[-1].to_bar(timeframe).open_time.isoformat(),
-        )
-        return
-      # Nothing is remembered yet, so the whole window counts as unpublished
-      # and the bars that closed while this process was down are recovered. A
-      # bar the previous process already sent is republished — harmless,
-      # because ``event_id`` is deterministic and JetStream drops it as a
-      # duplicate.
-      self._emit_warmup(symbol, timeframe, rates)
+      # Nothing is published from the first read. Whatever closed before this
+      # process started is history, and history is the subscriber's to ask for.
+      self._remember_bar(symbol, timeframe, rates[-1].time)
+      log.info(
+        "MT5 %s %s primed at bar %s — publishing from the next close",
+        symbol,
+        timeframe.value,
+        rates[-1].to_bar(timeframe).open_time.isoformat(),
+      )
       return
 
     for rate in rates:
       if self._is_new_bar(symbol, timeframe, rate.time):
         self._emit(symbol, timeframe, rate.time, rate.to_bar(timeframe))
 
-  def _emit_warmup(
-    self, symbol: str, timeframe: Timeframe, rates: list[Mt5RateDTO]
-  ) -> None:
-    """Publish the start-up window as a numbered series, oldest first.
+  def _rates(self, records: Sequence[RateRecord]) -> list[Mt5RateDTO]:
+    """Validated records, one per open time, oldest first."""
+    by_time = {
+      dto.time: dto
+      for dto in (
+        Mt5RateDTO.from_record(record, self._mt5_config.SERVER_TIMEZONE)
+        for record in records
+      )
+    }
+    return [by_time[open_mark] for open_mark in sorted(by_time)]
 
-    ``warmup_total`` is the length of *this* window rather than the configured
-    ``warmup_bars``: a broker with a thinner archive hands back fewer bars, and
-    a subscriber that ends its warm-up on ``warmup_index == warmup_total``
-    would otherwise wait for a bar MT5 never had.
+  # ── History, on request ───────────────────────────────────────────
 
-    Called only for a stream nothing is remembered for yet, so every bar in the
-    window is new and the numbering is contiguous by construction.
+  async def _read_history(
+    self, symbol: str, timeframe: Timeframe, count: int
+  ) -> list[Bar]:
+    return await self._call_on_thread(
+      lambda: self._read_closed_bars(symbol, timeframe, count)
+    )
+
+  def _read_closed_bars(
+    self, symbol: str, timeframe: Timeframe, count: int
+  ) -> list[Bar]:
+    """The newest *count* closed bars. Runs on the gateway thread only.
+
+    Any timeframe MetaTrader 5 has may be asked for, not just the ones this
+    gateway polls: what a subscriber warms a window on is its decision. The
+    symbol does have to be configured, because that is what resolved the
+    broker's name for it and put it in Market Watch.
     """
-    # The whole window is converted before the first bar is published: a record
-    # the schema rejects half-way through would otherwise truncate a series
-    # that has already announced its own length, and the mark it moved means
-    # the next poll would not retry it — leaving a subscriber waiting for an
-    # index that never arrives. Raising here publishes nothing and leaves the
-    # mark untouched, so the next poll reads the window again.
-    window = [(rate.time, rate.to_bar(timeframe)) for rate in rates]
-    total = len(window)
+    broker_symbol = self._broker_symbol.get(symbol)
+    if broker_symbol is None:
+      raise HistoryUnavailableError(
+        f"MT5 has not resolved {symbol} on this broker — see the connect log"
+      )
+    if not self._terminal.is_connected():
+      raise HistoryUnavailableError("MT5 terminal is not connected to its trade server")
+    records = self._terminal.copy_rates_from_pos(broker_symbol, timeframe, 1, count)
+    if not records:
+      code, message = self._terminal.last_error()
+      raise HistoryUnavailableError(
+        f"MT5 returned no bars for {symbol} ({broker_symbol}) {timeframe.value} "
+        f"[{code}] {message}"
+      )
+    bars = [rate.to_bar(timeframe) for rate in self._rates(records)]
     log.info(
-      "MT5 %s %s backfilling %d closed bar(s) from %s",
+      "MT5 %s %s history: %d of %d bar(s) asked for, %s..%s",
       symbol,
       timeframe.value,
-      total,
-      window[0][1].open_time.isoformat(),
+      len(bars),
+      count,
+      bars[0].open_time.isoformat(),
+      bars[-1].open_time.isoformat(),
     )
-    for index, (open_mark, bar) in enumerate(window, start=1):
-      self._emit(
-        symbol, timeframe, open_mark, bar, warmup_index=index, warmup_total=total
-      )
+    return bars
 
-  def _emit(
-    self,
-    symbol: str,
-    timeframe: Timeframe,
-    open_mark: int,
-    bar: Bar,
-    *,
-    warmup_index: int | None = None,
-    warmup_total: int | None = None,
-  ) -> None:
-    """Hand one converted bar to the pipeline, then move the stream's mark.
-
-    A numbered call is a warm-up bar and an unnumbered one is live; the two
-    cannot disagree because there is only one place that decides.
-    """
-    warmup_bar = warmup_index is not None
+  def _emit(self, symbol: str, timeframe: Timeframe, open_mark: int, bar: Bar) -> None:
+    """Hand one converted bar to the pipeline, then move the stream's mark."""
     if log.isEnabledFor(logging.DEBUG):
       # Guarded: model_dump_json() would otherwise run on every bar even when
       # DEBUG is off, because arguments are evaluated before the call.
@@ -267,12 +267,5 @@ class Mt5Ingestion(ThreadedIngestion):
         timeframe.value,
         bar.model_dump_json(),
       )
-    self.emit_bar(
-      symbol,
-      timeframe,
-      bar,
-      warmup_bar=warmup_bar,
-      warmup_index=warmup_index,
-      warmup_total=warmup_total,
-    )
+    self.emit_bar(symbol, timeframe, bar)
     self._remember_bar(symbol, timeframe, open_mark)

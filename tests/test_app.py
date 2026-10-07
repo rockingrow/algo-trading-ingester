@@ -65,7 +65,28 @@ def make_settings(*, markets=None, problems=None) -> Settings:
   return config
 
 
-def make_runtime_factory(connection: FakeConnection, notifier: FakeNotifier):
+class FakeResponder:
+  """Records which gateways it was asked to serve history for."""
+
+  def __init__(self, fail: bool = False) -> None:
+    self.fail = fail
+    self.started_with: list[str] | None = None
+    self.stopped = False
+
+  async def start(self, ingestions) -> None:
+    if self.fail:
+      raise RuntimeError("NATS is not connected")
+    self.started_with = [ingestion.gateway.value for ingestion in ingestions]
+
+  async def stop(self) -> None:
+    self.stopped = True
+
+
+def make_runtime_factory(
+  connection: FakeConnection,
+  notifier: FakeNotifier,
+  responder: FakeResponder | None = None,
+):
   terminal = FakeTerminal()
   terminal.set_rates("XAUUSD", Timeframe.M5, [rate(1_790_000_100)])
   stream = FakeKlineStream([kline(T0_MS, interval="5m")])
@@ -100,9 +121,33 @@ def make_runtime_factory(connection: FakeConnection, notifier: FakeNotifier):
       connection=connection,
       publisher=FakePublisher(),
       subject_filter="TEST.>",
+      history_responder=responder,
     )
 
   return runtime_factory
+
+
+def test_history_is_served_for_every_gateway_that_started_and_stopped_first():
+  connection, notifier, responder = FakeConnection(), FakeNotifier(), FakeResponder()
+  app = create_app(
+    make_settings(), make_runtime_factory(connection, notifier, responder)
+  )
+  with TestClient(app):
+    assert responder.started_with == ["mt5", "binance"]
+    assert responder.stopped is False
+  assert responder.stopped is True
+
+
+def test_a_responder_that_cannot_start_degrades_the_service_without_stopping_it():
+  connection, notifier = FakeConnection(), FakeNotifier()
+  responder = FakeResponder(fail=True)
+  app = create_app(
+    make_settings(), make_runtime_factory(connection, notifier, responder)
+  )
+  with TestClient(app) as client:
+    # Bars still flow: only the ability to fill a window on request is lost.
+    assert client.get("/health").json()["status"] == "ok"
+  assert any("history requests" in message for message in notifier.messages)
 
 
 def test_lifespan_health_and_status():
