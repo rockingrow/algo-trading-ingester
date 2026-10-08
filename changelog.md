@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Added — stopping the service: by hand, and by itself
+
+- **`make stop`** (`uv run python -m ingester.stop`) force-stops a running
+  ingester: it reads `APP_PORT` from `.env` and kills **every** process whose
+  socket has that TCP port as its **local** port — `taskkill /F /T` on
+  Windows, `SIGKILL` elsewhere — so a detached or wedged run cannot keep the
+  port and block the next `make run`. Owners are read with `netstat -ano`
+  (Windows) or `ss 'sport = :<port>'`, falling back to
+  `lsof -iTCP:<port> -sTCP:LISTEN`: a process merely *connected* to someone
+  else's `:8090` is never killed, and PID 0/4 are skipped. Nothing else is
+  filtered — whatever else holds that port goes down with it.
+  `make stop PORT=8091` overrides the port for a one-off. The kill skips the
+  ordered shutdown (no *stopped* message, no NATS drain); nothing is buffered
+  to disk, so no bar is lost — Ctrl-C is still the way to stop it politely.
+- **The ingester now stops itself when NATS stays unreachable.** New
+  `NATS_GIVE_UP_AFTER_ATTEMPTS` (300) and `NATS_GIVE_UP_WINDOW_SECONDS`
+  (1800): one failed attempt is counted per `NATS_RECONNECT_TIME_WAIT` while
+  the link is down, and once that many land inside the rolling window the
+  process posts **NATS Unreachable — Ingester Stopping** and shuts down
+  through the normal lifecycle, so the message is delivered before it goes. It
+  does **not** restart itself — an operator does, by hand. A reconnect does
+  not clear the count, so a link that keeps flapping inside the window gives
+  up too; `0` disables it entirely.
+- **Why.** An ingester that cannot reach NATS publishes nothing. Retrying
+  silently for hours leaves a process that looks alive, answers `/health` and
+  delivers no bars; being plainly down, with a reason in the chat, is what an
+  operator can act on. The watchdog polls the connection instead of counting
+  nats-py's `error_cb`: that callback also fires on a healthy connection, and
+  never fires at all when the *first* connect was abandoned — which is exactly
+  the case where the process would otherwise run blind forever.
+- **Under a supervisor**, configure it to leave the process down after this
+  shutdown; an automatic restart only dials the same dead NATS again.
+
 ### Changed — history is asked for, not pushed at start-up (breaking)
 
 - **A gateway publishes nothing at start-up.** The first read only records the

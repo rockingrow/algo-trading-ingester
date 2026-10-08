@@ -162,6 +162,19 @@ class NatsSettings(BaseSettings):
   SUBJECT_PREFIX: str = "INGEST"
   CONNECT_TIMEOUT: float = 5.0
   RECONNECT_TIME_WAIT: float = 2.0
+  #: Failed connection attempts inside ``GIVE_UP_WINDOW_SECONDS`` after which
+  #: the ingester stops itself instead of retrying forever. An ingester that
+  #: cannot reach NATS publishes nothing, so retrying for hours only hides the
+  #: outage; it shuts down, says why on Telegram and waits for an operator.
+  #: One attempt is counted per ``RECONNECT_TIME_WAIT`` while the link is down,
+  #: which is nats-py's own retry cadence — at the defaults, 300 attempts is
+  #: ten minutes of being unreachable inside any half-hour. 0 disables it and
+  #: the process retries for as long as it runs.
+  GIVE_UP_AFTER_ATTEMPTS: int = Field(default=300, ge=0)
+  #: Length of the rolling window those attempts are counted in. Attempts are
+  #: never reset by a successful reconnect, so a link that keeps flapping
+  #: inside the window gives up too.
+  GIVE_UP_WINDOW_SECONDS: float = Field(default=1800.0, gt=0)
   #: Core NATS publish is fire-and-forget; JetStream persists each bar so a
   #: subscriber that was down can replay it, de-duplicated by ``event_id``.
   JETSTREAM_ENABLED: bool = False

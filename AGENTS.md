@@ -74,6 +74,7 @@ make install-dev    # uv sync (dev group: ruff, pytest, pytest-asyncio)
 make lint / format  # ruff check . / ruff format .   (make fix = both, with --fix)
 make test           # uv run pytest
 make run            # uv run python -m ingester   (reads .env)
+make stop           # force-kill every process on APP_PORT (PORT=... overrides)
 make help           # every target, one line each
 
 uv run pytest -q                            # whole suite (both venues are faked)
@@ -117,6 +118,8 @@ package; never scan from the repository root.
 | MT5 rate → canonical `Bar`, server time → UTC | `ingester/gateways/forex/mt5/dto.py` |
 | MetaTrader5 package adapter | `ingester/gateways/forex/mt5/terminal.py` |
 | NATS connection and one-way publisher | `ingester/services/nats_service.py` |
+| Giving up on an unreachable NATS and stopping the process | `ReconnectWatchdog` in `ingester/services/nats_service.py`, `ingester/shutdown.py` |
+| Force-stopping a running service by its port (`make stop`) | `ingester/stop.py` |
 | History request/reply contract | `ingester/schemas/history_schema.py`, `examples/nats/history.*.json` |
 | History responder (the one NATS subscription), reply sizing, the `online` announcement | `ingester/services/history_service.py` |
 | Reading history from a venue | `BaseIngestion.fetch_history` / `_read_history`, `ThreadedIngestion._call_on_thread` in `ingester/core/ingestion.py` |
@@ -173,6 +176,12 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
   way — a history read — only through `_call_on_thread`.
 - **Notifications never block the pipeline.** Everything goes through
   `QueuedNotifier`; a slow Telegram must not delay a bar.
+- **A dependency being down is reported, not fatal — except NATS for too
+  long.** Everything else runs degraded and says so. Once
+  `NATS_GIVE_UP_AFTER_ATTEMPTS` connection attempts have failed inside
+  `NATS_GIVE_UP_WINDOW_SECONDS`, the process stops *itself* through
+  `request_shutdown` — graceful, so the Telegram message explaining it is
+  drained — and stays down until an operator starts it again.
 
 ## Code style
 

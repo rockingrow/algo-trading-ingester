@@ -1,4 +1,4 @@
-.PHONY: help install install-dev update lock fix format lint check test run start forex crypto
+.PHONY: help install install-dev update lock fix format lint check test run start stop forex crypto
 
 help:
 	@echo "Available commands:"
@@ -11,6 +11,7 @@ help:
 	@echo "  make lint          - ruff check"
 	@echo "  make test          - Run the pytest suite"
 	@echo "  make run           - Run the ingester (reads .env)"
+	@echo "  make stop          - Force-stop every process holding APP_PORT (.env)"
 	@echo "  make forex         - Create config/forex.toml from its example, comments stripped (keeps an existing file)"
 	@echo "  make crypto        - Create config/crypto.toml from its example, comments stripped (keeps an existing file)"
 
@@ -47,6 +48,12 @@ run:
 
 # Kept as an alias of run.
 start: run
+
+# Force-stop the ingester: kills every process bound to APP_PORT from .env, so
+# a detached or wedged run cannot keep the port and block the next "make run".
+# PORT=... overrides it for a one-off.
+stop:
+	uv run python -m ingester.stop $(if $(PORT),--port $(PORT),)
 
 # Never overwrite: config/<market>.toml is the operator's own, git-ignored file.
 # The rule has no prerequisite, so make only runs it when the file is missing.

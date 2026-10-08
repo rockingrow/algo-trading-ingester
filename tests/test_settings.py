@@ -166,6 +166,22 @@ def test_an_rpc_prefix_inside_the_published_tree_is_refused(rpc_prefix):
     )
 
 
+def test_give_up_defaults_and_bounds(monkeypatch):
+  config = NatsSettings(_env_file=None)
+  assert (config.GIVE_UP_AFTER_ATTEMPTS, config.GIVE_UP_WINDOW_SECONDS) == (
+    300,
+    1800.0,
+  )
+
+  monkeypatch.setenv("NATS_GIVE_UP_AFTER_ATTEMPTS", "0")  # never give up
+  assert NatsSettings().GIVE_UP_AFTER_ATTEMPTS == 0
+
+  with pytest.raises(ValidationError):
+    NatsSettings(_env_file=None, GIVE_UP_AFTER_ATTEMPTS=-1)
+  with pytest.raises(ValidationError):
+    NatsSettings(_env_file=None, GIVE_UP_WINDOW_SECONDS=0)
+
+
 def test_env_fills_what_the_table_leaves_out(tmp_path, monkeypatch):
   # Credentials stay in .env; the table owns what to ingest. Init arguments
   # outrank the environment, so the table wins where both speak.
