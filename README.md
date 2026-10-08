@@ -71,6 +71,22 @@ uv run python -m ingester   # or: make run
 
 Response shapes are under [HTTP endpoints](#-http-endpoints).
 
+Ctrl-C stops it in order (gateways → NATS drain → Telegram). When a run was
+detached, or is wedged and still holding the port:
+
+```bash
+make stop                   # or: uv run python -m ingester.stop
+make stop PORT=8091         # another port than APP_PORT, for a one-off
+```
+
+It reads `APP_PORT` from `.env` and force-kills **every** process whose socket
+has that **local** port — `taskkill /F /T` on Windows, `SIGKILL` elsewhere — so
+the next `make run` can bind. A client merely *connected* to some other host's
+`:8090` is never touched. Nothing else is filtered, so give the ingester a port
+of its own. A hard kill skips the ordered shutdown: no *stopped* message on
+Telegram and no NATS drain. Published bars are already downstream and nothing is
+buffered to disk, so no data is lost; use Ctrl-C when you want the notification.
+
 ### 4. Test
 
 ```bash
@@ -370,7 +386,9 @@ With `TELEGRAM_ENABLED=true`, the bot posts to every chat in `TELEGRAM_CHAT_IDS`
   reason), `failed` (it would not start), `stopped` — the **running** message
   names each stream as `<market>/<GATEWAY>`, so it is clear which file it came
   from
-- NATS **disconnected** / **reconnected**
+- NATS **disconnected** / **reconnected**, and **NATS Unreachable — Ingester
+  Stopping** when it has given up and is shutting itself down (see
+  [Staying up](#staying-up))
 
 Messages go through a bounded queue, so a slow Telegram never delays a bar.
 
@@ -392,6 +410,19 @@ running: NATS reconnects underneath, the markets that *did* load keep ingesting,
 and a supervisor restart would only drop more bars. One malformed record on one
 symbol — or one unreadable websocket frame — is logged and skipped without
 starving the rest.
+
+**One exception: NATS staying unreachable.** An ingester that cannot reach NATS
+publishes nothing, so retrying quietly for hours only hides the outage. Once
+`NATS_GIVE_UP_AFTER_ATTEMPTS` connection attempts have failed inside
+`NATS_GIVE_UP_WINDOW_SECONDS` — by default 300 attempts, one per
+`NATS_RECONNECT_TIME_WAIT`, so about ten minutes of being unreachable within any
+half hour — it posts **NATS Unreachable — Ingester Stopping** and shuts itself
+down the ordered way, so that message is actually delivered. It does **not**
+restart itself: an operator starts it again once NATS is back. A reconnect does
+not clear the count, so a link that keeps flapping inside the window gives up
+too; `NATS_GIVE_UP_AFTER_ATTEMPTS=0` turns the whole thing off. Under a
+supervisor that restarts the process, set the supervisor to leave it down —
+otherwise it will be restarted into the same dead NATS.
 
 ---
 
@@ -466,6 +497,7 @@ The FastAPI server, logging, NATS, Telegram, which markets to run, and venue
 | `NATS_HOST`, `NATS_PORT`, `NATS_TOKEN` | `localhost`, `4222`, blank | Connection; blank token = no auth |
 | `NATS_SUBJECT_PREFIX` | `INGEST` | First subject token, and the JetStream stream name |
 | `NATS_CONNECT_TIMEOUT`, `NATS_RECONNECT_TIME_WAIT` | `5.0`, `2.0` | Seconds to dial, seconds between reconnects |
+| `NATS_GIVE_UP_AFTER_ATTEMPTS`, `NATS_GIVE_UP_WINDOW_SECONDS` | `300`, `1800` | Failed attempts in that window after which the service stops itself and waits for an operator — `0` = never, see [Staying up](#staying-up) |
 | `NATS_JETSTREAM_ENABLED` | `false` | `false` = core NATS, fire-and-forget. `true` = persisted and de-duplicated |
 | `NATS_PUBLISH_TIMEOUT` | `5.0` | Seconds one JetStream publish ack may take |
 | `NATS_STREAM_MAX_AGE_SECONDS` | `604800` | Stream retention, 7 days. Set at creation only |

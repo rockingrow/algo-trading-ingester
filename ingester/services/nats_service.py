@@ -15,12 +15,20 @@ Two delivery modes, chosen by ``NATS_JETSTREAM_ENABLED``:
   ``NATS_SUBJECT_PREFIX`` so a subscriber that was down can replay it.
   ``event_id`` rides as ``Nats-Msg-Id``, so a re-publish of the same bar is
   dropped by the stream.
+
+Reconnecting is not unlimited. :class:`ReconnectWatchdog` counts the failed
+attempts in a rolling window and, past ``NATS_GIVE_UP_AFTER_ATTEMPTS``, stops
+the whole service: an ingester that cannot reach NATS publishes nothing, and a
+process that retries silently for hours is worse than one that is plainly down.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import deque
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any
 
 import nats as nats_lib
@@ -33,15 +41,75 @@ from ingester.interfaces.notifier_protocol import Notifier
 from ingester.logger import get_logger
 from ingester.schemas.market_event_schema import MarketEvent
 from ingester.settings import NatsSettings
+from ingester.shutdown import request_shutdown
 
 log = get_logger(__name__)
+
+#: Floor for the watchdog's tick, so a very small ``RECONNECT_TIME_WAIT``
+#: cannot turn the check into a busy loop.
+_MIN_WATCHDOG_INTERVAL = 0.5
+
+
+class ReconnectWatchdog:
+  """Counts failed NATS connection attempts inside a rolling window.
+
+  One attempt is recorded per retry cadence while the link is down, and
+  anything older than the window is forgotten. A successful reconnect
+  deliberately does **not** clear the count: a link that keeps flapping never
+  carries bars reliably either, so it has to be able to trip this too.
+
+  It trips once. Giving up stops the process, and the caller must not be told
+  to do that twice.
+  """
+
+  def __init__(
+    self,
+    max_attempts: int,
+    window_seconds: float,
+    clock: Callable[[], float] = time.monotonic,
+  ) -> None:
+    self._max_attempts = max_attempts
+    self._window_seconds = window_seconds
+    self._clock = clock
+    self._failures: deque[float] = deque()
+    self._tripped = False
+
+  @property
+  def enabled(self) -> bool:
+    """``NATS_GIVE_UP_AFTER_ATTEMPTS=0`` means retry for as long as we run."""
+    return self._max_attempts > 0
+
+  @property
+  def attempts(self) -> int:
+    """Failed attempts still inside the window."""
+    return len(self._failures)
+
+  def record_failure(self) -> bool:
+    """Record one failed attempt; ``True`` when that was one too many."""
+    if not self.enabled or self._tripped:
+      return False
+    now = self._clock()
+    self._failures.append(now)
+    cutoff = now - self._window_seconds
+    while self._failures and self._failures[0] < cutoff:
+      self._failures.popleft()
+    if len(self._failures) < self._max_attempts:
+      return False
+    self._tripped = True
+    return True
 
 
 class NatsConnection:
   """Owns the NATS client and reports connection changes to operators."""
 
   def __init__(
-    self, config: NatsSettings, notifier: Notifier, instance_id: str
+    self,
+    config: NatsSettings,
+    notifier: Notifier,
+    instance_id: str,
+    *,
+    stop_service: Callable[[str], None] = request_shutdown,
+    clock: Callable[[], float] = time.monotonic,
   ) -> None:
     self._config = config
     self._notifier = notifier
@@ -53,6 +121,13 @@ class NatsConnection:
     self._closing = False
     #: Called after every re-established connection, in registration order.
     self._reconnect_hooks: list[Callable[[], Awaitable[None]]] = []
+    # How the connection stops the process once it has given up. Injected so
+    # tests can watch the decision without taking the test runner down.
+    self._stop_service = stop_service
+    self._watchdog = ReconnectWatchdog(
+      config.GIVE_UP_AFTER_ATTEMPTS, config.GIVE_UP_WINDOW_SECONDS, clock=clock
+    )
+    self._watchdog_task: asyncio.Task[None] | None = None
 
   def on_reconnect(self, hook: Callable[[], Awaitable[None]]) -> None:
     """Run *hook* each time the connection comes back after a drop."""
@@ -79,6 +154,12 @@ class NatsConnection:
     return self._js
 
   async def connect(self) -> None:
+    # Started before the first attempt, so a server that is already down at
+    # boot is counted too: the bounded first connect below abandons nats-py's
+    # retry loop, and without the watchdog the process would sit there
+    # publishing nothing for as long as it ran.
+    self._start_watchdog()
+
     options: dict[str, Any] = {
       "servers": [self._config.url],
       "name": f"ingester-{self._instance_id}",
@@ -110,6 +191,9 @@ class NatsConnection:
       await self._ensure_stream()
 
   async def close(self) -> None:
+    # Before the early return: the watchdog outlives a connect that failed,
+    # and a shutdown must not leave it counting.
+    await self._stop_watchdog()
     if self._nc is None:
       return
     self._closing = True
@@ -184,6 +268,73 @@ class NatsConnection:
         window,
         wanted_window,
       )
+
+  # ── Giving up ─────────────────────────────────────────────────────
+
+  def _start_watchdog(self) -> None:
+    if not self._watchdog.enabled or self._watchdog_task is not None:
+      return
+    self._watchdog_task = asyncio.get_running_loop().create_task(
+      self._watch_connection(), name="nats-reconnect-watchdog"
+    )
+    log.info(
+      "NATS watchdog armed: stopping the service after %d failed attempts "
+      "within %.0f min",
+      self._config.GIVE_UP_AFTER_ATTEMPTS,
+      self._config.GIVE_UP_WINDOW_SECONDS / 60,
+    )
+
+  async def _stop_watchdog(self) -> None:
+    task, self._watchdog_task = self._watchdog_task, None
+    if task is None:
+      return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+      await task
+
+  async def _watch_connection(self) -> None:
+    """Count one failed attempt per retry cadence while the link is down.
+
+    Polling rather than nats-py's ``error_cb``: that callback also fires for
+    errors raised on a healthy connection, and it never fires at all when the
+    first connect was abandoned — the two cases this has to cover.
+    """
+    interval = max(self._config.RECONNECT_TIME_WAIT, _MIN_WATCHDOG_INTERVAL)
+    while True:
+      await asyncio.sleep(interval)
+      if await self._check_connection():
+        return
+
+  async def _check_connection(self) -> bool:
+    """One watchdog tick. ``True`` once it has given up and said so."""
+    if self._closing or self.is_connected:
+      return False
+    if not self._watchdog.record_failure():
+      return False
+    await self._give_up()
+    return True
+
+  async def _give_up(self) -> None:
+    """Report that NATS is unreachable and stop the service for good."""
+    attempts = self._watchdog.attempts
+    window_seconds = self._config.GIVE_UP_WINDOW_SECONDS
+    reason = (
+      f"NATS at {self._config.url} is unreachable: {attempts} failed "
+      f"connection attempts within {window_seconds / 60:.0f} min, nothing can "
+      "be published"
+    )
+    log.error("%s. Giving up; the service will not restart on its own.", reason)
+    # Queued, and the graceful shutdown drains that queue — so the message
+    # explaining the stop is delivered before the process is gone.
+    await self._notifier.send_message(
+      messages.nats_gave_up(
+        url=self._config.url,
+        instance_id=self._instance_id,
+        attempts=attempts,
+        window_seconds=window_seconds,
+      )
+    )
+    self._stop_service(reason)
 
   # ── Callbacks ─────────────────────────────────────────────────────
 

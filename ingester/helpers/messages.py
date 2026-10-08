@@ -91,6 +91,26 @@ def nats_reconnected(*, url: str, instance_id: str) -> str:
   )
 
 
+def nats_gave_up(
+  *, url: str, instance_id: str, attempts: int, window_seconds: float
+) -> str:
+  """NATS stayed unreachable, so the ingester is stopping itself.
+
+  The last message this process sends: it says the service is down on purpose,
+  and that only an operator can bring it back.
+  """
+  return "\n".join(
+    [
+      f"{em.SERVICE_FAILED} <b>NATS Unreachable — Ingester Stopping</b>"
+      f" ({_code(instance_id)})",
+      f"{em.NATS_DISCONNECTED} {_code(url)} — {attempts} failed connection"
+      f" attempts in {window_seconds / 60:.0f} min, no bar is being published.",
+      f"{em.SERVICE_STOPPED} Shutting down, and <b>not</b> restarting on its"
+      " own — start it again by hand once NATS is back.",
+    ]
+  )
+
+
 def _clip(text: str, limit: int, *, keep_tail: bool = False) -> str:
   """Trim to *limit* characters — Telegram rejects messages over 4096."""
   if len(text) <= limit:
