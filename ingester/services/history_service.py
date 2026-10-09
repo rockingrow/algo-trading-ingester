@@ -39,7 +39,10 @@ only after the subscriptions are, so a request it provokes always finds a
 responder.
 
 A subscription survives a reconnect — nats-py re-establishes it — so the only
-thing done on one is to announce again.
+thing done on one is to announce again. The exception is a NATS that was down
+at start-up, when there is nothing to re-establish: the first connect that
+works subscribes then, so a late NATS does not leave the ingester publishing
+bars and answering no request until a restart.
 """
 
 from __future__ import annotations
@@ -79,7 +82,7 @@ class HistoryResponder:
     self._config = config
     self._subscriptions: list[Any] = []
     self._ingestions: list[Ingestion] = []
-    connection.on_reconnect(self._announce_reconnected)
+    connection.on_reconnect(self._on_connected)
 
   def online_subject_for(self, ingestion: Ingestion) -> str:
     """Where *ingestion*'s gateway says it is there to be asked."""
@@ -93,7 +96,13 @@ class HistoryResponder:
     return f"{self._config.rpc_prefix}-{HISTORY_TOKEN}-{ingestion.gateway.value}"
 
   async def start(self, ingestions: list[Ingestion]) -> None:
-    """Listen for each gateway's requests. Raises when NATS is not connected."""
+    """Listen for each gateway's requests. Raises when NATS is not connected.
+
+    The gateways are remembered *before* the first subscribe, so a start that
+    failed on an unconnected NATS can be replayed from the reconnect hook with
+    the same set.
+    """
+    self._ingestions = list(ingestions)
     for ingestion in ingestions:
       subject = self.subject_for(ingestion)
       queue = self.queue_for(ingestion)
@@ -106,7 +115,6 @@ class HistoryResponder:
       )
       self._subscriptions.append(subscription)
       log.info("History requests served on %s (queue=%s)", subject, queue)
-    self._ingestions = list(ingestions)
     # The server has to know about the subscriptions before anyone is told to
     # use them, or the first request an announcement provokes finds nobody.
     await self._connection.nc.flush()
@@ -134,9 +142,23 @@ class HistoryResponder:
         ",".join(timeframe.value for timeframe in announcement.timeframes),
       )
 
-  async def _announce_reconnected(self) -> None:
+  async def _on_connected(self) -> None:
+    """Re-announce after a reconnect — or subscribe, if that never happened.
+
+    nats-py re-establishes a subscription itself, so a reconnect only has to
+    announce. A connection that was **down at start-up** is the other case:
+    :meth:`start` raised on it and there is nothing subscribed, so the first
+    connect that works has to do what start-up could not. Without this, the
+    ingester would publish bars on a late connection and still answer no
+    history request until it was restarted.
+    """
     if self._subscriptions:
       await self.announce("reconnected")
+      return
+    if not self._ingestions:
+      return
+    log.info("NATS is up: subscribing to history requests after a failed start")
+    await self.start(self._ingestions)
 
   async def stop(self) -> None:
     self._ingestions = []

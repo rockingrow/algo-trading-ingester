@@ -87,8 +87,12 @@ class FakeNats:
     #: Everything done on the connection, in order: the order is the contract.
     self.journal: list[str] = []
     self.published: list[tuple[str, bytes]] = []
+    #: Raised out of ``subscribe`` while set — a NATS that is not connected.
+    self.fail_subscribe: Exception | None = None
 
   async def subscribe(self, subject: str, queue: str = "", cb: Any = None):
+    if self.fail_subscribe is not None:
+      raise self.fail_subscribe
     subscription = FakeSubscription()
     self.subscriptions[subject] = (queue, cb, subscription)
     self.journal.append(f"subscribe {subject}")
@@ -108,6 +112,14 @@ class FakeConnection:
   def __init__(self, nats: FakeNats) -> None:
     self.nc = nats
     self.reconnect_hooks: list[Any] = []
+
+  @property
+  def fail_subscribe(self) -> Any:
+    return self.nc.fail_subscribe
+
+  @fail_subscribe.setter
+  def fail_subscribe(self, error: Any) -> None:
+    self.nc.fail_subscribe = error
 
   def on_reconnect(self, hook: Any) -> None:
     self.reconnect_hooks.append(hook)
@@ -357,6 +369,41 @@ async def test_a_reconnect_announces_again():
     OnlineAnnouncement.model_validate_json(data).reason for _, data in nats.published
   ]
   assert reasons == ["started", "reconnected"]
+
+
+async def test_a_late_first_connect_subscribes_after_a_failed_start():
+  # NATS was down at start-up: there is no subscription to re-establish, so
+  # the first connect that works has to do what start() could not. Without it
+  # the ingester publishes bars and answers no history request until a restart.
+  nats = FakeNats()
+  settings = NatsSettings(_env_file=None, SUBJECT_PREFIX="INGESTER")
+  connection = FakeConnection(nats)
+  responder = HistoryResponder(connection, settings)
+  connection.fail_subscribe = RuntimeError("NATS is not connected")
+
+  with pytest.raises(RuntimeError):
+    await responder.start([FakeIngestion()])
+  assert nats.subscriptions == {}
+
+  connection.fail_subscribe = None
+  await connection.reconnect()
+
+  assert SUBJECT in nats.subscriptions
+  reasons = [
+    OnlineAnnouncement.model_validate_json(data).reason for _, data in nats.published
+  ]
+  assert reasons == ["started"]
+
+
+async def test_a_late_connect_without_gateways_announces_nothing():
+  nats = FakeNats()
+  connection = FakeConnection(nats)
+  HistoryResponder(connection, NatsSettings(_env_file=None, SUBJECT_PREFIX="INGESTER"))
+
+  await connection.reconnect()
+
+  assert nats.subscriptions == {}
+  assert nats.published == []
 
 
 async def test_nothing_is_announced_before_start_or_after_stop():

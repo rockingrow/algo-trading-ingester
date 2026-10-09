@@ -61,8 +61,32 @@ market keeps ingesting.
 ### 3. Run
 
 ```bash
-uv run python -m ingester   # or: make run
+make start                  # or: uv run python -m ingester — foreground, Ctrl-C stops it
 ```
+
+That is the only way this repository runs the service: in the foreground, with
+its logs on the console, and Ctrl-C stopping it **in order** — gateways → NATS
+drain → the Telegram *stopped* message.
+
+**Running it in the background is the host's job**, not this repository's. A
+supervisor restarts it on failure, starts it at boot, captures and rotates its
+output, and — the part that matters most — stops it with a signal it can act
+on. On Linux that is a systemd unit or pm2; on Windows a service wrapper
+(NSSM, `sc.exe`) or Task Scheduler with *run whether user is logged on or not*.
+Two things to set there:
+
+- **`ExecStop` must send `SIGINT`** (pm2 already does by default). That is the
+  one path to the ordered shutdown, and therefore the only way to get the
+  Telegram *stopped* message and a NATS drain. A hard kill skips all of it.
+- **`LOG_CONSOLE=false`**, because the supervisor already captures stdout. The
+  mirror is a *synchronous* write on the thread that logged — a gateway's own
+  poll thread — so a console that cannot keep up holds up bar-close detection.
+  On Windows it is worse than slow: a console with Quick Edit enabled blocks
+  every writer the moment someone selects text in it.
+
+Do not keep a visible terminal open as the way the service runs on a Windows
+VPS. Beyond Quick Edit, closing that window sends `CTRL_CLOSE_EVENT`, which
+kills the process outright: no log line, no Telegram message, no NATS drain.
 
 - `GET /health` — liveness + NATS connection state
 - `GET /status` — per-gateway status (with its market), symbols, timeframes,
@@ -71,8 +95,30 @@ uv run python -m ingester   # or: make run
 
 Response shapes are under [HTTP endpoints](#-http-endpoints).
 
-Ctrl-C stops it in order (gateways → NATS drain → Telegram). When a run was
-detached, or is wedged and still holding the port:
+#### Is it running?
+
+A service put in the background by a supervisor is only reachable by asking its
+port, which is what this does:
+
+```bash
+make status                 # or: uv run python -m ingester.status
+make status PORT=8091       # another port than APP_PORT, for a one-off
+```
+
+It answers in two steps, because they are different questions: who holds
+`APP_PORT` (the same probe `make stop` kills by), then what `GET /status`
+reports per gateway. A process that holds the port but will not answer is
+called out as wedged rather than as running. The exit code is for scripts —
+`0` running and healthy, `1` not running, `2` running but unreachable, with
+NATS down, or with a gateway that is not running — so `make status` prints
+make's own `Error 1` line under the report when the service is down. It only
+ever reads.
+
+On Linux, `find_pids` needs `ss` (from `iproute2`) or `lsof` on the host, and
+reads only the PIDs of the user that owns them: run `make status` and
+`make stop` as the user the service runs as.
+
+#### Force-stopping a wedged run
 
 ```bash
 make stop                   # or: uv run python -m ingester.stop
@@ -81,11 +127,27 @@ make stop PORT=8091         # another port than APP_PORT, for a one-off
 
 It reads `APP_PORT` from `.env` and force-kills **every** process whose socket
 has that **local** port — `taskkill /F /T` on Windows, `SIGKILL` elsewhere — so
-the next `make run` can bind. A client merely *connected* to some other host's
+the next start can bind. A client merely *connected* to some other host's
 `:8090` is never touched. Nothing else is filtered, so give the ingester a port
 of its own. A hard kill skips the ordered shutdown: no *stopped* message on
 Telegram and no NATS drain. Published bars are already downstream and nothing is
-buffered to disk, so no data is lost; use Ctrl-C when you want the notification.
+buffered to disk, so no data is lost — but under a supervisor this is the wrong
+tool twice over: it will be restarted immediately, and `SIGINT` through the
+supervisor is what you actually want.
+
+#### Reading the log
+
+The logger writes `<LOG_DIR>/<YYYYMMDD>.log`, one file per day, and deletes
+files older than `LOG_RETENTION_DAYS` (default 30) at start-up and at each
+midnight roll. `0` keeps everything, for a host where something else rotates the
+directory. Only names that parse as a date are ever deleted.
+
+Keep `LOG_LEVEL=INFO` for a service that is actually running: `DEBUG` dumps
+every venue payload — this ingester has written **400 MB in a single day** at
+that level, averaging 7.5 KB per DEBUG line — and that volume goes to the
+console too whenever `LOG_CONSOLE` is on. Use `DEBUG` to investigate, not to
+run. Under a supervisor, read the output it captured (`journalctl -u …`,
+`pm2 logs`); otherwise `tail -f` the day file, remembering it rolls at midnight.
 
 ### 4. Test
 

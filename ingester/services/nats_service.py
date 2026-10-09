@@ -16,6 +16,12 @@ Two delivery modes, chosen by ``NATS_JETSTREAM_ENABLED``:
   ``event_id`` rides as ``Nats-Msg-Id``, so a re-publish of the same bar is
   dropped by the stream.
 
+A **first connect that fails is retried in the background**, because nats-py's
+reconnect loop belongs to a client that a failed connect never created: an
+ingester started before its NATS server has to be able to reach it later. A
+late connect runs the same reconnect hooks, so the history subscriptions and
+the ``online`` announcement land as they would after an outage.
+
 Reconnecting is not unlimited. :class:`ReconnectWatchdog` counts the failed
 attempts in a rolling window and, past ``NATS_GIVE_UP_AFTER_ATTEMPTS``, stops
 the whole service: an ingester that cannot reach NATS publishes nothing, and a
@@ -128,6 +134,9 @@ class NatsConnection:
       config.GIVE_UP_AFTER_ATTEMPTS, config.GIVE_UP_WINDOW_SECONDS, clock=clock
     )
     self._watchdog_task: asyncio.Task[None] | None = None
+    #: Dials NATS until it answers, when the first connect did not. ``None``
+    #: whenever no retry is pending.
+    self._connect_retry_task: asyncio.Task[None] | None = None
 
   def on_reconnect(self, hook: Callable[[], Awaitable[None]]) -> None:
     """Run *hook* each time the connection comes back after a drop."""
@@ -154,12 +163,27 @@ class NatsConnection:
     return self._js
 
   async def connect(self) -> None:
+    """Dial NATS once, and keep trying in the background if that failed.
+
+    The caller is told about a failed first connect — the service reports
+    itself degraded over it — but the process does not stay cut off: nats-py's
+    reconnect loop belongs to a *client that exists*, and a first connect that
+    raised leaves none, so without the retry below an ingester started before
+    its NATS server would never reach it, however long it ran.
+    """
     # Started before the first attempt, so a server that is already down at
     # boot is counted too: the bounded first connect below abandons nats-py's
     # retry loop, and without the watchdog the process would sit there
     # publishing nothing for as long as it ran.
     self._start_watchdog()
+    try:
+      await self._dial()
+    except ConnectionError:
+      self._start_connect_retry()
+      raise
 
+  async def _dial(self) -> None:
+    """One bounded connect attempt, plus what a fresh connection needs."""
     options: dict[str, Any] = {
       "servers": [self._config.url],
       "name": f"ingester-{self._instance_id}",
@@ -185,18 +209,77 @@ class NatsConnection:
         f"NATS at {self._config.url} did not answer within "
         f"{self._config.CONNECT_TIMEOUT:.1f}s"
       ) from exc
+    except OSError as exc:
+      # A name that does not resolve, a refused port: the same outage as a
+      # timeout from here, and one error type is all the caller has to handle.
+      raise ConnectionError(
+        f"NATS at {self._config.url} is unreachable: {exc}"
+      ) from exc
     log.info("NATS connected to %s", self._config.url)
 
     if self._config.JETSTREAM_ENABLED:
       await self._ensure_stream()
 
-  async def close(self) -> None:
-    # Before the early return: the watchdog outlives a connect that failed,
-    # and a shutdown must not leave it counting.
-    await self._stop_watchdog()
-    if self._nc is None:
+  def _start_connect_retry(self) -> None:
+    if self._connect_retry_task is not None:
       return
+    self._connect_retry_task = asyncio.get_running_loop().create_task(
+      self._retry_connect(), name="nats-connect-retry"
+    )
+    log.info(
+      "NATS first connect failed; retrying every %.1fs in the background",
+      max(self._config.RECONNECT_TIME_WAIT, _MIN_WATCHDOG_INTERVAL),
+    )
+
+  async def _retry_connect(self) -> None:
+    """Keep dialling until it works, then run the reconnect hooks.
+
+    The cadence is ``RECONNECT_TIME_WAIT``, the one nats-py itself would use,
+    so the watchdog's count of failed attempts means the same thing whichever
+    loop is retrying. A late connect is reported like a reconnect — from an
+    operator's and a subscriber's point of view it is one — and the hooks are
+    what puts the history subscriptions in place and the ``online``
+    announcement out.
+    """
+    interval = max(self._config.RECONNECT_TIME_WAIT, _MIN_WATCHDOG_INTERVAL)
+    while not self._closing:
+      await asyncio.sleep(interval)
+      if self._closing:
+        return
+      try:
+        await self._dial()
+      except ConnectionError as exc:
+        log.debug("NATS still unreachable: %s", exc)
+        continue
+      except Exception:
+        log.exception("Retrying the NATS connection failed unexpectedly")
+        continue
+      self._connect_retry_task = None
+      await self._notifier.send_message(
+        messages.nats_reconnected(url=self._config.url, instance_id=self._instance_id)
+      )
+      await self._run_reconnect_hooks()
+      return
+
+  async def _run_reconnect_hooks(self) -> None:
+    for hook in self._reconnect_hooks:
+      try:
+        await hook()
+      except Exception:
+        # One hook failing must not cost the others, nor nats-py its callback.
+        log.exception("A NATS reconnect hook failed")
+
+  async def close(self) -> None:
+    # Set first: it stops the retry loop from dialling into a shutdown, and
+    # keeps the drain's own disconnect out of the operators' chat.
     self._closing = True
+    # Before the early return: both of these outlive a connect that failed,
+    # and a shutdown must not leave them running.
+    await self._stop_watchdog()
+    await self._stop_connect_retry()
+    if self._nc is None:
+      self._closing = False
+      return
     try:
       # Drain flushes anything still buffered instead of dropping it.
       await self._nc.drain()
@@ -292,6 +375,14 @@ class NatsConnection:
     with suppress(asyncio.CancelledError):
       await task
 
+  async def _stop_connect_retry(self) -> None:
+    task, self._connect_retry_task = self._connect_retry_task, None
+    if task is None or task is asyncio.current_task():
+      return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+      await task
+
   async def _watch_connection(self) -> None:
     """Count one failed attempt per retry cadence while the link is down.
 
@@ -351,12 +442,7 @@ class NatsConnection:
     await self._notifier.send_message(
       messages.nats_reconnected(url=self._config.url, instance_id=self._instance_id)
     )
-    for hook in self._reconnect_hooks:
-      try:
-        await hook()
-      except Exception:
-        # One hook failing must not cost the others, nor nats-py its callback.
-        log.exception("A NATS reconnect hook failed")
+    await self._run_reconnect_hooks()
 
   async def _on_error(self, exc: Exception) -> None:
     log.error("NATS error: %s", exc)

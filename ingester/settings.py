@@ -138,6 +138,14 @@ class LoggingSettings(BaseSettings):
 
   LEVEL: str = "INFO"
   DIR: str = "logs"
+  #: Mirror the log to stdout as well as to the day's file. Turn it off when a
+  #: supervisor (systemd, pm2, NSSM) already captures stdout: the write is
+  #: synchronous and happens on the thread that logged, so a console that
+  #: cannot keep up holds up a gateway's poll loop.
+  CONSOLE: bool = True
+  #: Delete ``<DIR>/<YYYYMMDD>.log`` files older than this many days, at
+  #: start-up and at each midnight roll. ``0`` keeps every file forever.
+  RETENTION_DAYS: int = Field(default=30, ge=0)
 
 
 class NatsSettings(BaseSettings):
@@ -252,8 +260,9 @@ class TelegramSettings(BaseSettings):
   #: Both fall back to BOT_TOKEN / CHAT_IDS when blank.
   LOG_BOT_TOKEN: str = ""
   LOG_CHAT_IDS: str = ""
-  #: Seconds an identical error is suppressed — a failing poll repeats every
-  #: interval and would otherwise flood the chat.
+  #: Seconds one log statement is suppressed after its first message. Keyed on
+  #: the statement, not on the formatted text: a failure that repeats per bar
+  #: carries a new event id each time and would otherwise flood the chat.
   LOG_DEDUP_WINDOW: float = 60.0
 
   @property

@@ -1,6 +1,7 @@
 """The shared ingestion bases, exercised through a minimal venue."""
 
 import asyncio
+import logging
 from typing import Any, ClassVar
 
 import pytest
@@ -65,6 +66,96 @@ def make_ingestion(frames: list[Any]) -> tuple[ScriptedIngestion, FakeNotifier]:
     instance_id="test",
   )
   return ingestion, notifier
+
+
+def bar(open_epoch: int) -> Any:
+  """One canonical bar, built the way the Binance gateway builds it."""
+  raw = kline(open_epoch * 1000)["data"]["k"]
+  return BinanceKlineDTO.model_validate(raw).to_bar(M1)
+
+
+class CollectingHandler(logging.Handler):
+  """Records straight off the dispatcher's logger.
+
+  Attached to the module's own logger, not the root: ``ingester`` does not
+  propagate, so ``caplog`` would see nothing.
+  """
+
+  def __init__(self) -> None:
+    super().__init__(logging.DEBUG)
+    self.records: list[logging.LogRecord] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+
+  def levels_for(self, needle: str) -> list[str]:
+    return [
+      record.levelname for record in self.records if needle in record.getMessage()
+    ]
+
+
+@pytest.fixture
+def dispatcher_logs():
+  handler = CollectingHandler()
+  logger = logging.getLogger("ingester.core.ingestion")
+  logger.addHandler(handler)
+  try:
+    yield handler
+  finally:
+    logger.removeHandler(handler)
+
+
+async def test_a_run_of_identical_publish_failures_is_one_error(dispatcher_logs):
+  # An unreachable NATS fails every bar, and every ERROR is mirrored to
+  # Telegram: the first failure is the news, the rest are the same outage.
+  ingestion, _ = make_ingestion([])
+  ingestion._publisher.fail_with = ConnectionError("NATS is not connected")
+  await ingestion.start()
+  for open_time in (60, 120, 180):
+    ingestion.emit_bar("BTCUSDT", M1, bar(open_time))
+  await wait_for(lambda: len(dispatcher_logs.levels_for("Failed to publish")) == 3)
+  await ingestion.stop()
+
+  assert dispatcher_logs.levels_for("Failed to publish") == [
+    "ERROR",
+    "WARNING",
+    "WARNING",
+  ]
+  assert ingestion.snapshot()["failed"] == 3
+
+
+async def test_a_different_failure_is_reported_again(dispatcher_logs):
+  ingestion, _ = make_ingestion([])
+  ingestion._publisher.fail_with = ConnectionError("NATS is not connected")
+  await ingestion.start()
+  ingestion.emit_bar("BTCUSDT", M1, bar(60))
+  await wait_for(lambda: len(dispatcher_logs.levels_for("Failed to publish")) == 1)
+
+  ingestion._publisher.fail_with = TimeoutError("ack timed out")
+  ingestion.emit_bar("BTCUSDT", M1, bar(120))
+  await wait_for(lambda: len(dispatcher_logs.levels_for("Failed to publish")) == 2)
+  await ingestion.stop()
+
+  assert dispatcher_logs.levels_for("Failed to publish") == ["ERROR", "ERROR"]
+
+
+async def test_a_successful_publish_ends_the_run(dispatcher_logs):
+  ingestion, _ = make_ingestion([])
+  ingestion._publisher.fail_with = ConnectionError("NATS is not connected")
+  await ingestion.start()
+  ingestion.emit_bar("BTCUSDT", M1, bar(60))
+  await wait_for(lambda: len(dispatcher_logs.levels_for("Failed to publish")) == 1)
+
+  ingestion._publisher.fail_with = None
+  ingestion.emit_bar("BTCUSDT", M1, bar(120))
+  await wait_for(lambda: ingestion._publisher.events != [])
+
+  ingestion._publisher.fail_with = ConnectionError("NATS is not connected")
+  ingestion.emit_bar("BTCUSDT", M1, bar(180))
+  await wait_for(lambda: len(dispatcher_logs.levels_for("Failed to publish")) == 2)
+  await ingestion.stop()
+
+  assert dispatcher_logs.levels_for("Failed to publish") == ["ERROR", "ERROR"]
 
 
 async def test_async_stream_is_running_on_the_first_frame_not_the_handshake():

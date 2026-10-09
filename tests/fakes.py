@@ -16,8 +16,12 @@ class FakePublisher:
     self.events: list[MarketEvent] = []
     self.is_connected = True
     self.subject_filter = "TEST.>"
+    #: Raised instead of publishing while set, for the failure paths.
+    self.fail_with: Exception | None = None
 
   async def publish(self, event: MarketEvent) -> None:
+    if self.fail_with is not None:
+      raise self.fail_with
     self.events.append(event)
 
 
