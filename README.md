@@ -61,8 +61,17 @@ market keeps ingesting.
 ### 3. Run
 
 ```bash
-uv run python -m ingester   # or: make run
+make dev                    # or: uv run python -m ingester — foreground, Ctrl-C stops it
+make start                  # or: uv run python -m ingester.start — detached, returns the shell
 ```
+
+`make dev` (still aliased as `make run`) keeps the process in the foreground
+with its logs on the console: that is the one to iterate under. `make start`
+spawns it detached, so it survives the shell that launched it, appends whatever
+it prints before the application logger takes over to
+`<LOG_DIR>/ingester.out.log`, and refuses to start when `APP_PORT` is already
+held — no PID file, because the port identifies the process. It reports the PID
+it spawned, not readiness: that is `GET /health`.
 
 - `GET /health` — liveness + NATS connection state
 - `GET /status` — per-gateway status (with its market), symbols, timeframes,
@@ -81,7 +90,7 @@ make stop PORT=8091         # another port than APP_PORT, for a one-off
 
 It reads `APP_PORT` from `.env` and force-kills **every** process whose socket
 has that **local** port — `taskkill /F /T` on Windows, `SIGKILL` elsewhere — so
-the next `make run` can bind. A client merely *connected* to some other host's
+the next `make start` can bind. A client merely *connected* to some other host's
 `:8090` is never touched. Nothing else is filtered, so give the ingester a port
 of its own. A hard kill skips the ordered shutdown: no *stopped* message on
 Telegram and no NATS drain. Published bars are already downstream and nothing is

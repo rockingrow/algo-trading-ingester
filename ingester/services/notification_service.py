@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import httpx
@@ -190,8 +191,19 @@ class TelegramLogHandler(logging.Handler):
   Installed on the package root logger, so it sees records from every thread —
   including the gateway's watcher thread. Delivery is handed to the event loop
   and then to *notifier*'s queue, so a blocked ``api.telegram.org`` can never
-  slow a poll down. Identical records inside ``dedup_window`` are dropped: a
-  failing poll repeats every interval and would otherwise flood the chat.
+  slow a poll down.
+
+  **De-duplication is on the log template, not the formatted message.** Inside
+  ``dedup_window``, the first record of a given ``logger:level:msg`` is sent and
+  the rest are counted. The spam this exists for repeats with a *different*
+  text every time — ``"Failed to publish %s: %s"`` carries a fresh ``event_id``
+  per bar, so one unreachable NATS turned every bar close into its own message
+  — and keying on the formatted message never collapsed any of it. The cost is
+  that two different failures sharing one template read as one message plus a
+  count; the full text of each is in the day's log file either way.
+
+  The count is not dropped: the next record on that key, after the window has
+  passed, says how many were suppressed meanwhile.
   """
 
   #: Records from this module are never forwarded — a failing Telegram send
@@ -209,7 +221,7 @@ class TelegramLogHandler(logging.Handler):
     self._notifier = notifier
     self._instance_id = instance_id
     self._dedup_window = dedup_window
-    self._seen: dict[str, float] = {}
+    self._seen: dict[str, _DedupState] = {}
     self._lock = threading.Lock()
     self._loop: asyncio.AbstractEventLoop | None = None
     self._tasks: set[asyncio.Task[None]] = set()
@@ -228,13 +240,20 @@ class TelegramLogHandler(logging.Handler):
       loop = self._loop
       if loop is None or loop.is_closed():
         return
-      if self._suppressed(record):
+      suppressed, repeats = self._decide(record)
+      if suppressed:
         return
+      message = record.getMessage()
+      if repeats:
+        # Said on the first record that gets through after the window, so a
+        # collapsed burst is visible as a burst rather than as one failure.
+        window = self._dedup_window
+        message = f"{message}\n({repeats} more like this in the last {window:.0f}s)"
       text = messages.log_error(
         instance_id=self._instance_id,
         logger_name=record.name,
         level=record.levelname,
-        message=record.getMessage(),
+        message=message,
         traceback_text=_format_exception(record),
       )
       loop.call_soon_threadsafe(self._send, text)
@@ -242,21 +261,41 @@ class TelegramLogHandler(logging.Handler):
       # logging must never raise into the caller's code path.
       self.handleError(record)
 
-  def _suppressed(self, record: logging.LogRecord) -> bool:
-    key = f"{record.name}:{record.levelno}:{record.getMessage()}"
+  def _decide(self, record: logging.LogRecord) -> tuple[bool, int]:
+    """``(suppress this record, how many were suppressed before it)``.
+
+    The key is the *unformatted* ``record.msg``, so every call of one log
+    statement shares it however its arguments differ.
+    """
+    key = f"{record.name}:{record.levelno}:{record.msg}"
     now = time.monotonic()
     with self._lock:
       cutoff = now - self._dedup_window
-      self._seen = {seen: at for seen, at in self._seen.items() if at > cutoff}
-      if key in self._seen:
-        return True
-      self._seen[key] = now
-    return False
+      for seen, state in list(self._seen.items()):
+        if state.at <= cutoff and seen != key:
+          # Forgotten unsent: nothing is left to attribute the count to, and
+          # the window has passed. Keeping it would report a stale number later.
+          del self._seen[seen]
+      state = self._seen.get(key)
+      if state is not None and state.at > cutoff:
+        state.repeats += 1
+        return True, 0
+      repeats = state.repeats if state is not None else 0
+      self._seen[key] = _DedupState(at=now, repeats=0)
+    return False, repeats
 
   def _send(self, text: str) -> None:
     task = asyncio.create_task(self._notifier.send_message(text))
     self._tasks.add(task)
     task.add_done_callback(self._tasks.discard)
+
+
+@dataclass
+class _DedupState:
+  """When a log key was last sent, and how many were dropped since."""
+
+  at: float
+  repeats: int = 0
 
 
 def _format_exception(record: logging.LogRecord) -> str | None:

@@ -140,6 +140,36 @@ async def test_identical_errors_are_deduplicated_inside_the_window():
   assert len(notifier.messages) == 1
 
 
+async def test_one_log_statement_is_deduplicated_however_its_text_differs():
+  # The spam this exists for: "Failed to publish %s" carries a new event_id
+  # per bar, so an unreachable NATS used to send one message per closed bar.
+  notifier = RecordingNotifier()
+  handler = _handler(notifier, dedup_window=60.0)
+  for open_time in range(5):
+    record = _record("Failed to publish %s: %s")
+    record.args = (f"mt5:XAUUSD:M1:{open_time}", "NATS is not connected")
+    handler.emit(record)
+  await _settle()
+
+  (message,) = notifier.messages
+  assert "mt5:XAUUSD:M1:0" in message
+
+
+async def test_the_next_message_says_how_many_were_suppressed():
+  notifier = RecordingNotifier()
+  handler = _handler(notifier, dedup_window=60.0)
+  handler.emit(_record("Failed to publish %s"))
+  for _ in range(3):
+    handler.emit(_record("Failed to publish %s"))
+  handler._dedup_window = 0.0  # the window has passed
+  handler.emit(_record("Failed to publish %s"))
+  await _settle()
+
+  first, second = notifier.messages
+  assert "more like this" not in first
+  assert "3 more like this" in second
+
+
 async def test_different_errors_are_not_deduplicated():
   notifier = RecordingNotifier()
   handler = _handler(notifier, dedup_window=60.0)

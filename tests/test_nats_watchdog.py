@@ -1,7 +1,10 @@
-"""Giving up on NATS: the rolling attempt window, and the stop it triggers."""
+"""The NATS connection's own retries: the attempt window, the stop it
+triggers, and the background retry of a first connect that failed."""
 
 import asyncio
 from types import SimpleNamespace
+
+import pytest
 
 from ingester.services.nats_service import NatsConnection, ReconnectWatchdog
 from ingester.settings import NatsSettings
@@ -19,9 +22,18 @@ class FakeClock:
     self.now += seconds
 
 
+async def _noop() -> None:
+  return None
+
+
 def _link_up(connection) -> None:
-  """Stand in for a live nats-py client: ``is_connected`` reads off it."""
-  connection._nc = SimpleNamespace(is_connected=True)
+  """Stand in for a live nats-py client: ``is_connected`` reads off it.
+
+  ``drain`` is there so ``close()`` takes its normal path on it.
+  """
+  connection._nc = SimpleNamespace(
+    is_connected=True, drain=_noop, close=_noop, jetstream=lambda: None
+  )
 
 
 def _link_down(connection) -> None:
@@ -178,3 +190,68 @@ async def test_the_watchdog_is_not_armed_when_disabled():
   connection, _, _, _ = make_connection(GIVE_UP_AFTER_ATTEMPTS=0)
   connection._start_watchdog()
   assert connection._watchdog_task is None
+
+
+# ── Retrying a first connect that failed ───────────────────────────
+
+
+async def test_a_failed_first_connect_is_retried_in_the_background():
+  # nats-py's reconnect loop belongs to a client that a failed connect never
+  # created, so without this the process never reaches a NATS that came up
+  # after it did.
+  connection, notifier, _, _ = make_connection(RECONNECT_TIME_WAIT=0.01)
+  attempts = []
+
+  async def dial():
+    attempts.append(1)
+    if len(attempts) < 3:
+      raise ConnectionError("unreachable")
+    _link_up(connection)
+
+  connection._dial = dial
+  hooks = []
+  connection.on_reconnect(lambda: hooks.append(1) or asyncio.sleep(0))
+
+  with pytest.raises(ConnectionError):
+    await connection.connect()
+  assert connection._connect_retry_task is not None
+
+  await asyncio.wait_for(connection._connect_retry_task, timeout=3.0)
+
+  assert len(attempts) == 3
+  assert connection.is_connected
+  # Reported and hooked like a reconnect: that is what re-subscribes to
+  # history requests and announces the gateways as online.
+  assert any("reconnect" in message.lower() for message in notifier.messages)
+  assert hooks == [1]
+  await connection.close()
+
+
+async def test_a_successful_first_connect_starts_no_retry():
+  connection, _, _, _ = make_connection(RECONNECT_TIME_WAIT=0.01)
+
+  async def dial():
+    _link_up(connection)
+
+  connection._dial = dial
+  await connection.connect()
+
+  assert connection._connect_retry_task is None
+  await connection.close()
+
+
+async def test_closing_stops_the_retry():
+  connection, _, _, _ = make_connection(RECONNECT_TIME_WAIT=0.01)
+
+  async def dial():
+    raise ConnectionError("unreachable")
+
+  connection._dial = dial
+  with pytest.raises(ConnectionError):
+    await connection.connect()
+  task = connection._connect_retry_task
+
+  await connection.close()
+
+  assert task.cancelled() or task.done()
+  assert connection._connect_retry_task is None

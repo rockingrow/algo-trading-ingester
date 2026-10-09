@@ -252,8 +252,9 @@ class TelegramSettings(BaseSettings):
   #: Both fall back to BOT_TOKEN / CHAT_IDS when blank.
   LOG_BOT_TOKEN: str = ""
   LOG_CHAT_IDS: str = ""
-  #: Seconds an identical error is suppressed — a failing poll repeats every
-  #: interval and would otherwise flood the chat.
+  #: Seconds one log statement is suppressed after its first message. Keyed on
+  #: the statement, not on the formatted text: a failure that repeats per bar
+  #: carries a new event id each time and would otherwise flood the chat.
   LOG_DEDUP_WINDOW: float = 60.0
 
   @property

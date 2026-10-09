@@ -118,6 +118,9 @@ class BaseIngestion(ABC):
     self._failed = 0
     self._last_published_at: datetime | None = None
     self._last_error: str | None = None
+    #: Error class of the last failed publish, so a run of identical failures
+    #: is reported once instead of once per bar. See ``_report_publish_error``.
+    self._last_error_type: str | None = None
     self._last_bar: dict[str, str] = {}
     #: History requests answered and refused, for the /status endpoint.
     self._history_served = 0
@@ -351,6 +354,9 @@ class BaseIngestion(ABC):
       try:
         await self._publisher.publish(event)
         self._published += 1
+        # A publish that worked ends the run, so the next failure is reported
+        # at ERROR even when it is the same kind as the last one.
+        self._last_error_type = None
         self._last_published_at = utcnow()
         log.debug("Published %s", event.event_id)
       except asyncio.CancelledError:
@@ -358,9 +364,32 @@ class BaseIngestion(ABC):
       except Exception as exc:
         self._failed += 1
         self._last_error = f"{type(exc).__name__}: {exc}"
-        log.error("Failed to publish %s: %s", event.event_id, exc)
+        self._report_publish_error(event, exc)
       finally:
         self._queue.task_done()
+
+  def _report_publish_error(self, event: MarketEvent, exc: Exception) -> None:
+    """Log a failed publish: ERROR the first time, WARNING while it repeats.
+
+    An unreachable NATS fails *every* bar, and the ERROR mirror forwards each
+    one to Telegram. The first failure of a kind is what an operator needs;
+    the ones that follow are the same outage seen again, already counted in
+    ``failed`` on ``/status`` and already announced as *Ingester Degraded* —
+    and an unreachable NATS has its own watchdog to stop the service. The
+    level drops back to ERROR as soon as the failure changes, or after a
+    successful publish has cleared the run.
+    """
+    error_type = type(exc).__name__
+    repeated = error_type == self._last_error_type
+    self._last_error_type = error_type
+    if repeated:
+      log.warning(
+        "Failed to publish %s: %s (same failure as the previous bar)",
+        event.event_id,
+        exc,
+      )
+      return
+    log.error("Failed to publish %s: %s", event.event_id, exc)
 
   async def _stop_dispatcher(self) -> None:
     """Give queued events a bounded chance to publish, then cancel."""

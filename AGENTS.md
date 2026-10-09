@@ -73,7 +73,8 @@ cp config/crypto.example.toml config/crypto.toml  # … and the crypto market
 make install-dev    # uv sync (dev group: ruff, pytest, pytest-asyncio)
 make lint / format  # ruff check . / ruff format .   (make fix = both, with --fix)
 make test           # uv run pytest
-make run            # uv run python -m ingester   (reads .env)
+make dev            # uv run python -m ingester   (foreground, reads .env; make run is an alias)
+make start          # uv run python -m ingester.start   (detached background run)
 make stop           # force-kill every process on APP_PORT (PORT=... overrides)
 make help           # every target, one line each
 

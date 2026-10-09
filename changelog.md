@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### Fixed — an unreachable NATS no longer floods Telegram, and is recovered from
+
+- **The ERROR mirror de-duplicates on the log statement, not on the formatted
+  message.** `TELEGRAM_LOG_DEDUP_WINDOW` never collapsed the spam it exists
+  for: `"Failed to publish %s: %s"` carries a fresh `event_id` per bar, so a
+  NATS that was down turned **every closed bar into its own Telegram
+  message**. The key is now `logger:level:<unformatted message>`, and the first
+  message that gets through after the window says how many were suppressed
+  meanwhile. Two different failures sharing one log statement now read as one
+  message plus a count; the full text of each is in the day's log file.
+- **A run of identical publish failures is one ERROR.** The dispatcher reports
+  the first failure of a kind at ERROR and the ones that follow at WARNING, so
+  the mirror forwards the news and not the outage repeated once per bar. The
+  level returns to ERROR as soon as the failure changes or a publish succeeds.
+  `failed` and `last_error` on `/status` are unchanged.
+- **A first connect that fails is now retried.** nats-py's reconnect loop
+  belongs to a client that a failed `connect()` never created, so an ingester
+  started before its NATS server stayed cut off from it **for the whole run** —
+  the comment in `runtime.py` claiming otherwise was wrong. `NatsConnection`
+  now keeps dialling in the background every `NATS_RECONNECT_TIME_WAIT`, and a
+  late connect is reported and hooked like a reconnect. The give-up watchdog is
+  unchanged, so a NATS that never answers still stops the service.
+- **The history responder subscribes on that late connect.** `start()` raises
+  when NATS is down and there is then nothing for nats-py to re-establish; the
+  first connect that works now subscribes and announces, instead of leaving the
+  ingester publishing bars and answering no history request until a restart.
+
+### Added — starting the service: foreground or detached
+
+- **`make start`** (`uv run python -m ingester.start`) now starts the ingester
+  as a **detached background process** and returns the shell: it outlives the
+  terminal that launched it (`DETACHED_PROCESS` on Windows, a new session
+  elsewhere) and appends whatever it writes to the console — an import error, a
+  start-up traceback — to `<LOG_DIR>/ingester.out.log`, next to the application
+  logs. It refuses to start when `APP_PORT` is already held, checked with the
+  same probe `make stop` uses, so a second run cannot die on *address already
+  in use* seconds after the command reported success. No PID file is written:
+  the port already identifies the process, and `make stop` is what stops it.
+  `make start PORT=8091` checks another port for a one-off.
+- **`make dev`** is the blocking foreground run (`uv run python -m ingester`),
+  with its logs on the console and Ctrl-C stopping it in order. `make run` is
+  kept as an alias of it, so the older name keeps working.
+- **Why.** `make start` used to be an alias of `make run`, i.e. blocking, which
+  is wrong for the name: starting a service should hand the shell back. The two
+  modes are now separate commands, and starting reports the PID it spawned —
+  readiness is still `GET /health`.
+
 ### Added — stopping the service: by hand, and by itself
 
 - **`make stop`** (`uv run python -m ingester.stop`) force-stops a running

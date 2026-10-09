@@ -110,8 +110,10 @@ class IngesterRuntime:
     try:
       await self._connection.connect()
     except Exception as exc:
-      # nats-py reconnects on its own once the server answers; until then each
-      # publish fails loudly and is counted in the gateway's snapshot.
+      # Reported, not fatal: the connection keeps dialling in the background
+      # and subscribes to history requests on the first connect that works.
+      # Until then each publish fails — loudly once per kind of failure, then
+      # at WARNING — and is counted in the gateway's snapshot.
       log.error("NATS unavailable at start-up: %s", exc)
       problems.append(f"NATS {self._config.nats.url}: {type(exc).__name__}: {exc}")
 
