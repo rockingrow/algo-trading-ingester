@@ -138,6 +138,14 @@ class LoggingSettings(BaseSettings):
 
   LEVEL: str = "INFO"
   DIR: str = "logs"
+  #: Mirror the log to stdout as well as to the day's file. Turn it off when a
+  #: supervisor (systemd, pm2, NSSM) already captures stdout: the write is
+  #: synchronous and happens on the thread that logged, so a console that
+  #: cannot keep up holds up a gateway's poll loop.
+  CONSOLE: bool = True
+  #: Delete ``<DIR>/<YYYYMMDD>.log`` files older than this many days, at
+  #: start-up and at each midnight roll. ``0`` keeps every file forever.
+  RETENTION_DAYS: int = Field(default=30, ge=0)
 
 
 class NatsSettings(BaseSettings):

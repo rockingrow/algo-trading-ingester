@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+### Changed — the service runs in the foreground; backgrounding belongs to the host
+
+- **`make start` is the blocking foreground run** (`uv run python -m
+  ingester`). `make dev`, `make run`, `make logging` and `make logs` are gone,
+  along with `ingester/start.py` and `ingester/logs.py`. Detaching a process,
+  guarding the port, waiting for readiness and tailing a rolling log are all
+  things a supervisor does better: systemd or pm2 on Linux, NSSM/`sc.exe` or
+  Task Scheduler on Windows. They also restart on failure and start at boot,
+  which this repository never did.
+- **Stopping through the supervisor is the point.** `ExecStop` sending `SIGINT`
+  (pm2's default) runs the ordered shutdown — gateways, NATS drain, the Telegram
+  *stopped* message — which `make stop`, a hard kill by port, cannot. `make
+  stop` stays for a wedged port and `make status` for "is it up", both working
+  on whatever holds `APP_PORT` however it was started.
+- Why not keep a detached run of our own: on Windows it has nowhere safe to
+  live. Spawning with `DETACHED_PROCESS` leaves the `uv` launcher without a
+  console, so Windows hands the ingester a brand new **visible** one — and
+  closing that stray window sends `CTRL_CLOSE_EVENT`, killing the service with
+  no log line, no Telegram message and no NATS drain. Quick Edit on such a
+  console also blocks every writer while text is selected. A window-less run
+  cannot be read without a log tailer this repository should not own, and it
+  still would not restart on failure.
+
+### Added — `LOG_CONSOLE` and `LOG_RETENTION_DAYS`
+
+- **`LOG_CONSOLE` (default `true`) drops the stdout mirror.** The day file is
+  the log; stdout was a second, unconditional handler. `logging` is synchronous,
+  so that write happens on the thread that logged — a gateway's own poll thread
+  — and a console that cannot keep up delays bar-close detection. Under a
+  supervisor that already captures stdout the mirror is duplicate work, so set
+  it to `false` there.
+- **`LOG_RETENTION_DAYS` (default `30`) deletes old day files** at start-up and
+  at each midnight roll — nothing ever did before, and at `DEBUG` this service
+  has written **400 MB in one day** (7.5 KB per DEBUG line, which dumps the
+  whole venue payload). Only `<YYYYMMDD>.log` names are considered, so a file
+  the logger did not create as a day file is never touched, and a file that
+  cannot be deleted is skipped rather than raised on. `0` keeps everything, for
+  a host where something else rotates the directory.
+- `.env.example` says plainly that `LOG_LEVEL=DEBUG` is for investigating, not
+  for running.
+
+### Added — checking whether the service is running
+
+- **`make status` (`uv run python -m ingester.status`)** reports the state of a
+  run from outside it, which a detached `make start` leaves no other way to
+  see. It asks two questions in order: who holds `APP_PORT` — through
+  `stop.find_pids`, the same probe `make stop` kills by, so the two can never
+  disagree — and then what `GET /status` answers, printing each gateway's
+  status, symbols, timeframes, publish counters and newest published bar.
+- **A held but silent port is reported as wedged, not as running.** `find_pids`
+  alone cannot tell a started ingester from one that never finished starting
+  up; the HTTP probe can.
+- **The exit code is for scripts**: `0` running and healthy, `1` not running,
+  `2` running but unreachable, with NATS disconnected, or with a gateway that
+  is not running. `PORT=` / `HOST=` override `.env` for a one-off, and a
+  wildcard `APP_HOST` is dialled over loopback. Nothing is written and no
+  process is signalled.
+
 ### Fixed — an unreachable NATS no longer floods Telegram, and is recovered from
 
 - **The ERROR mirror de-duplicates on the log statement, not on the formatted
@@ -32,53 +90,19 @@
 ### Fixed — the test suite no longer writes to the service log
 
 - `ingester.logger` resolves `LOG_DIR` at import time from the real `.env`, so
-  `uv run pytest` appended its fakes to the day's service log: `make logging`
-  showed EURUSD bars no venue sent, a watchdog armed after one attempt and a
+  `uv run pytest` appended its fakes to the day's service log, which showed
+  EURUSD bars no venue sent, a watchdog armed after one attempt and a
   Telegram that was "down", mixed into what a running ingester had written. A
   new `tests/conftest.py` points `LOG_DIR` (and `SOURCE_CONFIG_DIR`) at a
   temporary directory before any `ingester` module is imported.
-
-### Added — watching the log live
-
-- **`make logging`** (`uv run python -m ingester.logs`, aliased `make logs`)
-  follows the service log the way `tail -f` would, and rolls to the new file at
-  midnight — which `tail -f` cannot, because the logger opens
-  `<LOG_DIR>/<YYYYMMDD>.log` per day. `LINES=` sets how much of the file is
-  printed first (default 50), `GREP=` keeps only the lines matching a
-  case-insensitive regular expression — the way to watch a `LOG_LEVEL=DEBUG`
-  log, where the MT5 gateway dumps whole rate arrays — and `CONSOLE=1` follows
-  `<LOG_DIR>/ingester.out.log` instead, where a detached run's start-up crash
-  lands. `--no-follow` prints the tail and exits, for piping. Written in Python
-  rather than shelling out, because Windows has no `tail` and the output is
-  flushed per line so a pipe sees it immediately.
-
-### Added — starting the service: foreground or detached
-
-- **`make start`** (`uv run python -m ingester.start`) now starts the ingester
-  as a **detached background process** and returns the shell: it outlives the
-  terminal that launched it (`DETACHED_PROCESS` on Windows, a new session
-  elsewhere) and appends whatever it writes to the console — an import error, a
-  start-up traceback — to `<LOG_DIR>/ingester.out.log`, next to the application
-  logs. It refuses to start when `APP_PORT` is already held, checked with the
-  same probe `make stop` uses, so a second run cannot die on *address already
-  in use* seconds after the command reported success. No PID file is written:
-  the port already identifies the process, and `make stop` is what stops it.
-  `make start PORT=8091` checks another port for a one-off.
-- **`make dev`** is the blocking foreground run (`uv run python -m ingester`),
-  with its logs on the console and Ctrl-C stopping it in order. `make run` is
-  kept as an alias of it, so the older name keeps working.
-- **Why.** `make start` used to be an alias of `make run`, i.e. blocking, which
-  is wrong for the name: starting a service should hand the shell back. The two
-  modes are now separate commands, and starting reports the PID it spawned —
-  readiness is still `GET /health`.
 
 ### Added — stopping the service: by hand, and by itself
 
 - **`make stop`** (`uv run python -m ingester.stop`) force-stops a running
   ingester: it reads `APP_PORT` from `.env` and kills **every** process whose
   socket has that TCP port as its **local** port — `taskkill /F /T` on
-  Windows, `SIGKILL` elsewhere — so a detached or wedged run cannot keep the
-  port and block the next `make run`. Owners are read with `netstat -ano`
+  Windows, `SIGKILL` elsewhere — so a crashed or wedged run cannot keep the
+  port and block the next `make start`. Owners are read with `netstat -ano`
   (Windows) or `ss 'sport = :<port>'`, falling back to
   `lsof -iTCP:<port> -sTCP:LISTEN`: a process merely *connected* to someone
   else's `:8090` is never killed, and PID 0/4 are skipped. Nothing else is

@@ -3,7 +3,7 @@ tests/conftest.py — Keep a test run out of the operator's files.
 
 ``ingester.logger`` resolves ``LOG_DIR`` **at import time**, from the real
 ``.env``, so without this the suite appends its fakes to the day's service log:
-``make logging`` then shows EURUSD bars that no venue sent, a watchdog armed
+the operator's log then shows EURUSD bars that no venue sent, a watchdog armed
 after one attempt and a Telegram that is "down", mixed into the lines a running
 ingester wrote. The log is what an incident is reconstructed from, so nothing
 but the service may write to it.

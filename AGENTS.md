@@ -73,10 +73,9 @@ cp config/crypto.example.toml config/crypto.toml  # … and the crypto market
 make install-dev    # uv sync (dev group: ruff, pytest, pytest-asyncio)
 make lint / format  # ruff check . / ruff format .   (make fix = both, with --fix)
 make test           # uv run pytest
-make dev            # uv run python -m ingester   (foreground, reads .env; make run is an alias)
-make start          # uv run python -m ingester.start   (detached background run)
+make start          # uv run python -m ingester   (foreground only, reads .env)
+make status         # is it running, and what is each gateway doing (PORT=/HOST=)
 make stop           # force-kill every process on APP_PORT (PORT=... overrides)
-make logging        # uv run python -m ingester.logs   (follow the log; LINES=/GREP=/CONSOLE=1)
 make help           # every target, one line each
 
 uv run pytest -q                            # whole suite (both venues are faked)
@@ -122,6 +121,8 @@ package; never scan from the repository root.
 | NATS connection and one-way publisher | `ingester/services/nats_service.py` |
 | Giving up on an unreachable NATS and stopping the process | `ReconnectWatchdog` in `ingester/services/nats_service.py`, `ingester/shutdown.py` |
 | Force-stopping a running service by its port (`make stop`) | `ingester/stop.py` |
+| Reporting whether the service runs, and each gateway's state (`make status`) | `ingester/status.py` |
+| Log handlers, daily file, the stdout mirror, retention | `ingester/logger.py` |
 | History request/reply contract | `ingester/schemas/history_schema.py`, `examples/nats/history.*.json` |
 | History responder (the one NATS subscription), reply sizing, the `online` announcement | `ingester/services/history_service.py` |
 | Reading history from a venue | `BaseIngestion.fetch_history` / `_read_history`, `ThreadedIngestion._call_on_thread` in `ingester/core/ingestion.py` |
@@ -158,6 +159,12 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
 - **A gateway's market comes from the file it is configured in.** `[mt5]` in
   `config/forex.toml` is forex. The table never repeats it, so it can never
   contradict it.
+- **The service runs in the foreground; backgrounding is the host's job.**
+  `make start` is a blocking run and the repository ships nothing to detach,
+  daemonise or supervise it — that is systemd, pm2, NSSM or Task Scheduler on
+  the host, which can restart it, start it at boot and stop it with `SIGINT` so
+  the ordered shutdown runs. `make status` and `make stop` work on whatever is
+  holding `APP_PORT`, however it was started.
 - **Bars go one way; history is asked for.** The ingester publishes closes
   and pushes nothing else — no warm-up window at start-up, no warm-up settings.
   The one thing it listens for is a history request, answered in a single

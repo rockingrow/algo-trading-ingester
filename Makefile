@@ -1,4 +1,4 @@
-.PHONY: help install install-dev update lock fix format lint check test run dev start stop logging logs forex crypto
+.PHONY: help install install-dev update lock fix format lint check test start status stop forex crypto
 
 help:
 	@echo "Available commands:"
@@ -10,10 +10,9 @@ help:
 	@echo "  make format        - ruff format"
 	@echo "  make lint          - ruff check"
 	@echo "  make test          - Run the pytest suite"
-	@echo "  make dev           - Run the ingester in the foreground, Ctrl-C to stop (reads .env)"
-	@echo "  make start         - Start the ingester detached, in the background"
+	@echo "  make start         - Run the ingester in the foreground, Ctrl-C to stop (reads .env)"
+	@echo "  make status        - Report whether the ingester is running and what each gateway is doing"
 	@echo "  make stop          - Force-stop every process holding APP_PORT (.env)"
-	@echo "  make logging       - Follow the service log live (LINES=/GREP=/CONSOLE=1; make logs is an alias)"
 	@echo "  make forex         - Create config/forex.toml from its example, comments stripped (keeps an existing file)"
 	@echo "  make crypto        - Create config/crypto.toml from its example, comments stripped (keeps an existing file)"
 
@@ -45,31 +44,26 @@ check: lint
 test:
 	uv run pytest
 
-# Blocking foreground run: logs on the console, Ctrl-C stops it in order
-# (gateways -> NATS drain -> Telegram). "run" is kept as its older name.
-dev:
+# The only way this repository runs the service: in the foreground, logs on the
+# console, Ctrl-C stopping it in order (gateways -> NATS drain -> Telegram).
+# Running it in the background is the host's job - systemd or pm2 on Linux, a
+# service wrapper or Task Scheduler on Windows - because a supervisor restarts
+# it on failure, starts it at boot and rotates what it captures, and because an
+# "ExecStop" sending SIGINT gets that ordered shutdown where a hard kill cannot.
+# Set LOG_CONSOLE=false there: the supervisor already captures stdout, and the
+# mirror costs a synchronous write on the thread that logged.
+start:
 	uv run python -m ingester
 
-run: dev
-
-# Detached background run: returns the shell at once and survives it. Refuses
-# to start when APP_PORT is already held, and appends whatever the process
-# prints to LOG_DIR/ingester.out.log. Stop it with "make stop".
-start:
-	uv run python -m ingester.start $(if $(PORT),--port $(PORT),)
-
-# Follow the log live, rolling to the new file at midnight — which plain
-# "tail -f" cannot do, since the logger opens <LOG_DIR>/<YYYYMMDD>.log per day.
-# LINES=... changes how much of the file is printed first (default 50);
-# CONSOLE=1 follows what a detached "make start" printed instead, and
-# GREP=... keeps only the matching lines — the way to watch a DEBUG log.
-logging:
-	uv run python -m ingester.logs $(if $(LINES),--lines $(LINES),) $(if $(CONSOLE),--console,) $(if $(GREP),--grep "$(GREP)",)
-
-logs: logging
+# Read-only check: who holds APP_PORT, then what GET /status answers. Exits
+# non-zero when the service is down or degraded, so make prints its own
+# "Error 1" line under the report — that is the answer, not a broken target.
+# PORT=... / HOST=... override .env for a one-off.
+status:
+	uv run python -m ingester.status $(if $(PORT),--port $(PORT),) $(if $(HOST),--host $(HOST),)
 
 # Force-stop the ingester: kills every process bound to APP_PORT from .env, so
-# a detached or wedged run cannot keep the port and block the next "make run".
+# a crashed or wedged run cannot keep the port and block the next "make start".
 # PORT=... overrides it for a one-off.
 stop:
 	uv run python -m ingester.stop $(if $(PORT),--port $(PORT),)
