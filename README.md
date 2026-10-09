@@ -96,6 +96,21 @@ of its own. A hard kill skips the ordered shutdown: no *stopped* message on
 Telegram and no NATS drain. Published bars are already downstream and nothing is
 buffered to disk, so no data is lost; use Ctrl-C when you want the notification.
 
+Follow the log while it runs — the logger opens a new
+`<LOG_DIR>/<YYYYMMDD>.log` per day, so this rolls over at midnight where a plain
+`tail -f` would go quiet:
+
+```bash
+make logging                # or: uv run python -m ingester.logs
+make logging LINES=200      # print more of the file before following
+make logging GREP=ERROR     # only matching lines (a regex, case-insensitive)
+make logging CONSOLE=1      # what a detached "make start" printed, crashes included
+make logs                   # an alias of make logging
+```
+
+`--no-follow` prints that tail and exits, which is the form to pipe into
+another command. Ctrl-C ends it; it only ever reads.
+
 ### 4. Test
 
 ```bash

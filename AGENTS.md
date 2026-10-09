@@ -76,6 +76,7 @@ make test           # uv run pytest
 make dev            # uv run python -m ingester   (foreground, reads .env; make run is an alias)
 make start          # uv run python -m ingester.start   (detached background run)
 make stop           # force-kill every process on APP_PORT (PORT=... overrides)
+make logging        # uv run python -m ingester.logs   (follow the log; LINES=/GREP=/CONSOLE=1)
 make help           # every target, one line each
 
 uv run pytest -q                            # whole suite (both venues are faked)
@@ -195,7 +196,9 @@ Do not scan `.venv/`, `uv.lock`, `__pycache__/`, `.pytest_cache/` or `logs/`.
   you.
 - Prefer explicit types and domain terminology over clever, compressed code.
 - Cover behaviour changes with focused tests, including failure paths and
-  boundary cases. Venues are faked in tests (`FakeTerminal`, `FakeKlineStream`
+  boundary cases. `tests/conftest.py` redirects `LOG_DIR` and
+  `SOURCE_CONFIG_DIR` to a temporary directory: a test run must never write to
+  the operator's log or read their market files. Venues are faked in tests (`FakeTerminal`, `FakeKlineStream`
   in `tests/fakes.py`) — no test may open a real socket.
 
 ## Verification

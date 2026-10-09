@@ -1,4 +1,4 @@
-.PHONY: help install install-dev update lock fix format lint check test run dev start stop forex crypto
+.PHONY: help install install-dev update lock fix format lint check test run dev start stop logging logs forex crypto
 
 help:
 	@echo "Available commands:"
@@ -13,6 +13,7 @@ help:
 	@echo "  make dev           - Run the ingester in the foreground, Ctrl-C to stop (reads .env)"
 	@echo "  make start         - Start the ingester detached, in the background"
 	@echo "  make stop          - Force-stop every process holding APP_PORT (.env)"
+	@echo "  make logging       - Follow the service log live (LINES=/GREP=/CONSOLE=1; make logs is an alias)"
 	@echo "  make forex         - Create config/forex.toml from its example, comments stripped (keeps an existing file)"
 	@echo "  make crypto        - Create config/crypto.toml from its example, comments stripped (keeps an existing file)"
 
@@ -56,6 +57,16 @@ run: dev
 # prints to LOG_DIR/ingester.out.log. Stop it with "make stop".
 start:
 	uv run python -m ingester.start $(if $(PORT),--port $(PORT),)
+
+# Follow the log live, rolling to the new file at midnight — which plain
+# "tail -f" cannot do, since the logger opens <LOG_DIR>/<YYYYMMDD>.log per day.
+# LINES=... changes how much of the file is printed first (default 50);
+# CONSOLE=1 follows what a detached "make start" printed instead, and
+# GREP=... keeps only the matching lines — the way to watch a DEBUG log.
+logging:
+	uv run python -m ingester.logs $(if $(LINES),--lines $(LINES),) $(if $(CONSOLE),--console,) $(if $(GREP),--grep "$(GREP)",)
+
+logs: logging
 
 # Force-stop the ingester: kills every process bound to APP_PORT from .env, so
 # a detached or wedged run cannot keep the port and block the next "make run".

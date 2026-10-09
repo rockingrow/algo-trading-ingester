@@ -29,6 +29,29 @@
   first connect that works now subscribes and announces, instead of leaving the
   ingester publishing bars and answering no history request until a restart.
 
+### Fixed — the test suite no longer writes to the service log
+
+- `ingester.logger` resolves `LOG_DIR` at import time from the real `.env`, so
+  `uv run pytest` appended its fakes to the day's service log: `make logging`
+  showed EURUSD bars no venue sent, a watchdog armed after one attempt and a
+  Telegram that was "down", mixed into what a running ingester had written. A
+  new `tests/conftest.py` points `LOG_DIR` (and `SOURCE_CONFIG_DIR`) at a
+  temporary directory before any `ingester` module is imported.
+
+### Added — watching the log live
+
+- **`make logging`** (`uv run python -m ingester.logs`, aliased `make logs`)
+  follows the service log the way `tail -f` would, and rolls to the new file at
+  midnight — which `tail -f` cannot, because the logger opens
+  `<LOG_DIR>/<YYYYMMDD>.log` per day. `LINES=` sets how much of the file is
+  printed first (default 50), `GREP=` keeps only the lines matching a
+  case-insensitive regular expression — the way to watch a `LOG_LEVEL=DEBUG`
+  log, where the MT5 gateway dumps whole rate arrays — and `CONSOLE=1` follows
+  `<LOG_DIR>/ingester.out.log` instead, where a detached run's start-up crash
+  lands. `--no-follow` prints the tail and exits, for piping. Written in Python
+  rather than shelling out, because Windows has no `tail` and the output is
+  flushed per line so a pipe sees it immediately.
+
 ### Added — starting the service: foreground or detached
 
 - **`make start`** (`uv run python -m ingester.start`) now starts the ingester
