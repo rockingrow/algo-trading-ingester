@@ -23,9 +23,10 @@ FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
 
 ## Rules
 
-1. **Commits**: only when the user asks. English, imperative, 72-char subject
-   at most. **No AI attribution of any kind** — no `Generated with Claude
-   Code`, no `Co-Authored-By: Claude`, no ChatGPT/Codex footer, no session link.
+1. **Commits and pull requests**: only when the user asks. English, imperative,
+   72-char subject at most. **No AI attribution of any kind**, in commit
+   messages *and* PR titles/descriptions — no `Generated with Claude Code`, no
+   `Co-Authored-By: Claude`, no ChatGPT/Codex footer, no session link.
 2. **English** for comments, docstrings, identifiers, log and exception strings,
    and every committed Markdown file.
 3. **Names**: explicit and domain-flavoured (`timeframe`, `open_time`, not
@@ -50,6 +51,12 @@ FastAPI, NATS; the `MetaTrader5` package exists for Windows only.
 7. **Never** expose, commit or copy secrets from `.env`, tokens, chat ids, MT5
    logins/passwords or account identifiers. `.env.example` carries
    placeholders only.
+8. **Never implement directly on a protected branch.** No edit, commit or push
+   lands on `dev`, `stage`, `prod` or `master`. Before changing anything, cut
+   a dedicated branch from the up-to-date base with the prefix that matches
+   the work — `feature/`, `fix/`, `hotfix/`, `chore/`, `refactor/`, `docs/`,
+   `test/` — then `<prefix>/<short-kebab-description>`. Changes reach a
+   protected branch only through a pull request (rule 4).
 
 ## Working approach
 
