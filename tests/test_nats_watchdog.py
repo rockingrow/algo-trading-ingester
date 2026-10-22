@@ -1,5 +1,6 @@
 """The NATS connection's own retries: the attempt window, the stop it
-triggers, and the background retry of a first connect that failed."""
+triggers, the background retry of a first connect that failed, and what its
+callbacks leave in the log."""
 
 import asyncio
 from types import SimpleNamespace
@@ -255,3 +256,22 @@ async def test_closing_stops_the_retry():
 
   assert task.cancelled() or task.done()
   assert connection._connect_retry_task is None
+
+
+# ── What an outage leaves in the log ───────────────────────────────
+
+
+async def test_error_callback_names_the_exception_type(caplog):
+  """A failed reconnect arrives as an exception with no message of its own.
+
+  Logged with %s it reads as "NATS error:" and nothing else, which is what an
+  operator has to work with while the link is down — so the type has to be
+  there.
+  """
+  connection, _, _, _ = make_connection()
+
+  with caplog.at_level("ERROR", logger="ingester.services.nats_service"):
+    await connection._on_error(TimeoutError())
+
+  (record,) = caplog.records
+  assert record.getMessage() == "NATS error: TimeoutError()"

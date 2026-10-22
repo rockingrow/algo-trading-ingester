@@ -87,6 +87,30 @@
   first connect that works now subscribes and announces, instead of leaving the
   ingester publishing bars and answering no history request until a restart.
 
+### Fixed — a NATS error with an empty message is no longer a blank log line
+
+- **The connection's error callback formats with `%r`, not `%s`.** nats-py
+  hands `error_cb` exceptions whose `str()` is empty — a bare `TimeoutError`
+  from a reconnect attempt is the common one — so every such failure wrote
+  `NATS error:` with nothing after it. On a link that stalls and recovers
+  several times an hour those blank lines were the only record of what nats-py
+  was failing on, which is exactly when an operator has nothing else to go on.
+  The same run now reads `NATS error: TimeoutError()`. The ERROR mirror
+  de-duplicates on the unformatted message, so no more of it reaches Telegram
+  than before.
+- **`AGENTS.md` now records what the live deployment's network does to this
+  service.** Its host can send UDP on port 53 only, so Tailscale never
+  establishes a direct path and everything reaching NATS is relayed over TCP
+  through DERP. A few seconds of loss on that relay stalls the NATS connection
+  for tens of seconds: `[WinError 121] The semaphore timeout period has
+  expired`, `nats: timeout` and `Authentication Timeout`, several times an
+  hour, with every client on the host dropping in the same second because one
+  DERP connection carries them all. The bars survive it — `qte-ingest` asks
+  for the gap through a history request — and nothing in this repository is at
+  fault, which is the part worth writing down. Blocked UDP also keeps NTP from
+  syncing, and a drifting host clock has a deadline: `qte-ingest` drops a bar
+  whose bucket closes more than five seconds after its own clock.
+
 ### Fixed — the test suite no longer writes to the service log
 
 - `ingester.logger` resolves `LOG_DIR` at import time from the real `.env`, so

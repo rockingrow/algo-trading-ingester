@@ -96,6 +96,24 @@ on any OS and needs no API key (the kline streams are public), but it does dial
 a live venue: point `ws_url` at `wss://testnet.binance.vision/stream`, or leave
 `enable = false`, rather than opening a socket to production from a session.
 
+## The live deployment's network
+
+The Windows host that runs the ingester can send UDP on port 53 only — its
+provider blocks every other UDP port. Two symptoms follow from that one fact,
+and neither is a fault in this repository, so do not look for one here:
+
+- **Tailscale never establishes a direct path**, so everything reaching NATS is
+  relayed through DERP, over TCP. The NATS connection then rides inside another
+  TCP connection, and a few seconds of loss on the relay stalls it for tens of
+  seconds. It reads as `[WinError 121] The semaphore timeout period has
+  expired`, `nats: timeout` and `Authentication Timeout`, several times an hour,
+  and every client on that host drops in the same second because one DERP
+  connection carries them all. The bars are not lost: `qte-ingest` asks for the
+  gap through a history request.
+- **NTP cannot sync**, so the host clock drifts, and `w32tm /resync` cannot fix
+  it while UDP/123 is blocked. `qte-ingest` drops a bar whose bucket closes more
+  than five seconds after its own clock, so the drift has a deadline.
+
 ## Repository navigation
 
 Route the task with the table before searching. Start inside the owning

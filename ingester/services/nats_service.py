@@ -445,7 +445,11 @@ class NatsConnection:
     await self._run_reconnect_hooks()
 
   async def _on_error(self, exc: Exception) -> None:
-    log.error("NATS error: %s", exc)
+    # nats-py hands some failures an exception whose str() is empty — a bare
+    # TimeoutError from a reconnect attempt is the common one — and %s then
+    # logs "NATS error:" with nothing after it, which tells an operator
+    # working through an outage nothing at all. %r always carries the type.
+    log.error("NATS error: %r", exc)
 
 
 class NatsPublisher:
