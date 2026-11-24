@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixed — a reconnect loop with no pause, a leaked NATS client, short or unfinished Binance history
+
+- **MT5 no longer redials in a loop with no pause.** When a poll found the
+  terminal cut off from its trade server, the gateway thread dialled again at
+  once. `initialize()` attaches to a running terminal regardless, so it
+  succeeded, the next poll failed and the loop went round again — thousands of
+  times a second against the fake terminal, flipping *running* ↔
+  *disconnected* with a Telegram message on every turn. The thread now waits
+  `reconnect_interval_seconds` after a lost connection (still answering
+  history requests meanwhile), and `connect` counts as done only once
+  the terminal reaches its trade server.
+- **A NATS client whose JetStream stream cannot be set up is closed.** It
+  used to stay open while the background retry dialled a new one, leaking a
+  live connection and its reconnect loop on every attempt. The failure is now
+  a `ConnectionError` like any other dial that failed: retried, and counted by
+  the give-up watchdog. The deliberate close does not notify *NATS
+  Disconnected*.
+- **Binance history is read page by page.** One klines request returns at
+  most 1000 rows, so a request for more came back with 999 bars and
+  `truncated: false`, which says the venue had no more. The gateway now pages
+  back with `endTime` until it has `count` bars or the venue runs out, up to
+  `NATS_HISTORY_MAX_BARS`.
+- **Binance history never hands out the bar still forming.** It used to be
+  told apart by comparing its close time with this host's clock, which cannot
+  sync NTP on the live deployment: a clock a few seconds fast returned the
+  forming candle as closed. The newest row is now taken as the forming bar
+  unless it ended a whole interval ago — which only a symbol that stopped
+  trading leaves behind. `BinanceKlineDTO.from_rest_row` takes `is_closed`
+  from its caller instead of a `now_ms`.
+
 ### Changed — the service runs in the foreground; backgrounding belongs to the host
 
 - **`make start` is the blocking foreground run** (`uv run python -m

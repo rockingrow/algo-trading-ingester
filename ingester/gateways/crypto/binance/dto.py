@@ -91,21 +91,20 @@ class BinanceKlineDTO(BaseBarDTO):
 
   @classmethod
   def from_rest_row(
-    cls, row: Sequence[Any], *, symbol: str, interval: str, now_ms: int
+    cls, row: Sequence[Any], *, symbol: str, interval: str, is_closed: bool
   ) -> BinanceKlineDTO:
     """One kline from the REST endpoint, whose rows are positional arrays.
 
     The symbol and interval are not in the row — they were the request — and
-    neither is ``x``: REST returns the bar still forming like any other. It is
-    recognised by its close time, which Binance sets to the bar's last
-    millisecond, so a bar is closed exactly once *now* is past it.
+    neither is ``x``: REST returns the bar still forming like any other, so
+    whether this row is closed is the caller's to say. It knows where the row
+    sat in the response, which this one row does not.
     """
     if len(row) < 9:
       raise ValueError(f"Binance kline row has {len(row)} field(s), expected 9+")
-    close_time_ms = int(row[6])
     return cls(
       open_time_ms=int(row[0]),
-      close_time_ms=close_time_ms,
+      close_time_ms=int(row[6]),
       symbol=symbol,
       interval=interval,
       open=row[1],
@@ -115,7 +114,7 @@ class BinanceKlineDTO(BaseBarDTO):
       volume=row[5],
       quote_volume=row[7],
       trade_count=int(row[8]),
-      is_closed=close_time_ms < now_ms,
+      is_closed=is_closed,
     )
 
   @property

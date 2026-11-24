@@ -274,8 +274,9 @@ timeframe and emits the bars Binance marks closed.
 - **Start-up**: the socket only carries bars that close while it is connected,
   so the bars that closed before this process started are not published. A
   subscriber that needs them [asks](#history-requests) and is answered from the
-  REST endpoint at `klines_url` — at most 999 closed bars per request,
-  Binance's limit less the bar still forming, in any timeframe Binance has.
+  REST endpoint at `klines_url`, in any timeframe Binance has. Binance returns
+  at most 1000 rows per klines call, so a larger request is read page by page
+  up to `NATS_HISTORY_MAX_BARS`; the bar still forming is never included.
 - **De-duplication**: the newest open time emitted per stream is remembered, so
   a reconnect that replays a bar, or a repeated final update, publishes once.
 - **Reconnects**: Binance closes a connection after 24 hours, and a socket that

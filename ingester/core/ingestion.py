@@ -667,9 +667,12 @@ class ThreadedIngestion(BaseIngestion):
           self._set_status(GatewayStatusEnum.DISCONNECTED, str(exc))
           self._safe_disconnect()
           connected = False
-          # Answer whoever is waiting before dialling again: the reconnect
-          # below may succeed and fail in a loop, and never reach an idle wait.
-          self._serve_calls(connected=False)
+          # Wait out the reconnect interval before dialling again — serving
+          # whoever is waiting meanwhile. Without it, a venue whose connect
+          # succeeds while its poll fails (an MT5 terminal that is up but cut
+          # off from its trade server) is dialled again at once, in a loop
+          # with no pause that flips the status, and notifies, on every turn.
+          self._idle(self._reconnect_interval, connected=False)
           continue
         except Exception:
           # A bug in one poll must not kill the feed; the next poll retries.

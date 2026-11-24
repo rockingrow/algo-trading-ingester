@@ -88,6 +88,11 @@ class Mt5Ingestion(ThreadedIngestion):
     if not ok:
       code, message = self._terminal.last_error()
       raise GatewayConnectionError(f"MT5 initialize failed [{code}] {message}")
+    # ``initialize`` attaches to a running terminal whether or not that
+    # terminal reaches its trade server. Only the latter is a live feed, so
+    # it is what has to hold before the gateway reports itself RUNNING.
+    if not self._terminal.is_connected():
+      raise GatewayConnectionError("MT5 terminal is not connected to its trade server")
 
     self._resolve_symbols()
 

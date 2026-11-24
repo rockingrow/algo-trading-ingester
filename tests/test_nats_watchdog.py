@@ -275,3 +275,67 @@ async def test_error_callback_names_the_exception_type(caplog):
 
   (record,) = caplog.records
   assert record.getMessage() == "NATS error: TimeoutError()"
+
+
+# ── A client whose JetStream set-up failed ─────────────────────────
+
+
+class _BrokenStreamClient:
+  """A client that connects but cannot have its stream created, and fires the
+  disconnected callback from ``close()`` as nats-py does."""
+
+  def __init__(self, disconnected_cb) -> None:
+    self.is_connected = True
+    self.closed = False
+    self._disconnected_cb = disconnected_cb
+
+  def jetstream(self):
+    async def stream_info(name):
+      raise RuntimeError("stream not found")
+
+    async def add_stream(config):
+      raise RuntimeError("JetStream not enabled")
+
+    return SimpleNamespace(stream_info=stream_info, add_stream=add_stream)
+
+  async def close(self) -> None:
+    self.closed = True
+    self.is_connected = False
+    await self._disconnected_cb()
+
+
+@pytest.fixture
+def broken_stream_server(monkeypatch):
+  clients: list[_BrokenStreamClient] = []
+
+  async def connect(**options):
+    client = _BrokenStreamClient(options["disconnected_cb"])
+    clients.append(client)
+    return client
+
+  monkeypatch.setattr("ingester.services.nats_service.nats_lib.connect", connect)
+  # The retry cadence is floored for production; a test does not wait it out.
+  monkeypatch.setattr("ingester.services.nats_service._MIN_WATCHDOG_INTERVAL", 0.01)
+  return clients
+
+
+async def test_a_client_whose_stream_cannot_be_set_up_is_closed_not_leaked(
+  broken_stream_server,
+):
+  connection, notifier, _, _ = make_connection(
+    JETSTREAM_ENABLED=True, RECONNECT_TIME_WAIT=0.01
+  )
+
+  with pytest.raises(ConnectionError, match="JetStream stream"):
+    await connection.connect()
+  # Retried like any connect that failed — every attempt with a new client.
+  await asyncio.sleep(0.2)
+  retry = connection._connect_retry_task
+  await connection.close()
+
+  assert retry is not None
+  assert len(broken_stream_server) >= 3
+  assert all(client.closed for client in broken_stream_server)
+  assert not connection.is_connected
+  # Closed on purpose, so not reported to operators as an outage.
+  assert not any("disconnected" in message.lower() for message in notifier.messages)

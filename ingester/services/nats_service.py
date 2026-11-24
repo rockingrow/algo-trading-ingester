@@ -125,6 +125,8 @@ class NatsConnection:
     # Set while we close on purpose, so the drain's own disconnect callback is
     # not reported to operators as an outage.
     self._closing = False
+    # Set while a client that failed its set-up is closed, for the same reason.
+    self._discarding = False
     #: Called after every re-established connection, in registration order.
     self._reconnect_hooks: list[Callable[[], Awaitable[None]]] = []
     # How the connection stops the process once it has given up. Injected so
@@ -201,7 +203,7 @@ class NatsConnection:
     # nats-py applies max_reconnect_attempts to the first connect too, so -1
     # would hang forever against a dead server. Bound it: fail fast at boot.
     try:
-      self._nc = await asyncio.wait_for(
+      client = await asyncio.wait_for(
         nats_lib.connect(**options), timeout=self._config.CONNECT_TIMEOUT
       )
     except TimeoutError as exc:
@@ -215,10 +217,41 @@ class NatsConnection:
       raise ConnectionError(
         f"NATS at {self._config.url} is unreachable: {exc}"
       ) from exc
+    # A fresh client gets a fresh JetStream context: a cached one would still
+    # point at whichever client came before it.
+    self._nc, self._js = client, None
     log.info("NATS connected to %s", self._config.url)
 
-    if self._config.JETSTREAM_ENABLED:
+    if not self._config.JETSTREAM_ENABLED:
+      return
+    try:
       await self._ensure_stream()
+    except Exception as exc:
+      # Without its stream every JetStream publish fails, so this connection is
+      # no use. It is closed rather than kept: the caller retries with a new
+      # client, and one left open here would leak — a live socket and its own
+      # reconnect loop — on every attempt. Raised as the same ConnectionError a
+      # refused dial is, so the retry and the watchdog treat it as one.
+      await self._discard_client()
+      raise ConnectionError(
+        f"NATS at {self._config.url}: JetStream stream "
+        f"{self._config.stream_name} could not be set up: {type(exc).__name__}: {exc}"
+      ) from exc
+
+  async def _discard_client(self) -> None:
+    """Close the current client without reporting it as an outage."""
+    client, self._nc, self._js = self._nc, None, None
+    if client is None:
+      return
+    # nats-py awaits the disconnected callback inside close(); this flag keeps
+    # a connection dropped on purpose out of the operators' chat.
+    self._discarding = True
+    try:
+      await client.close()
+    except Exception as exc:
+      log.debug("Closing a discarded NATS client failed: %s", exc)
+    finally:
+      self._discarding = False
 
   def _start_connect_retry(self) -> None:
     if self._connect_retry_task is not None:
@@ -430,7 +463,7 @@ class NatsConnection:
   # ── Callbacks ─────────────────────────────────────────────────────
 
   async def _on_disconnected(self) -> None:
-    if self._closing:
+    if self._closing or self._discarding:
       return
     log.warning("NATS disconnected from %s", self._config.url)
     await self._notifier.send_message(

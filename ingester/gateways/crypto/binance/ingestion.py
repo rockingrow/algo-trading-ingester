@@ -35,7 +35,7 @@ connect → receive → reconnect loop itself.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
@@ -157,37 +157,35 @@ class BinanceIngestion(AsyncStreamIngestion):
     """The newest *count* closed bars, from the REST klines endpoint.
 
     Any timeframe Binance has may be asked for, not just the ones on the
-    socket. One request, so at most :data:`KLINES_LIMIT` rows: Binance's
-    newest row is the bar still forming, which leaves one fewer closed bar.
+    socket. One klines request returns at most :data:`KLINES_LIMIT` rows, so a
+    larger *count* is read page by page, newest first, each page ending just
+    before the oldest row already held. Reading stops at *count*, or once a
+    page comes back short: the venue has no older bars.
+
+    Binance's newest row is the bar still forming. It is recognised by being
+    the newest row, not by its close time against this host's clock, which is
+    allowed to drift: a clock a few seconds fast would otherwise hand a
+    strategy a candle that is still moving.
     """
     interval = TIMEFRAME_INTERVALS[timeframe]
-    try:
-      rows = await self._history.klines(
-        symbol=symbol,
-        interval=interval,
-        # One more than asked for, because the newest row is still forming and
-        # handing it over would give a strategy an unfinished candle.
-        limit=min(count + 1, KLINES_LIMIT),
-      )
-    except GatewayConnectionError as exc:
-      raise HistoryUnavailableError(str(exc)) from exc
-    now_ms = int(utcnow().timestamp() * 1000)
-    # One kline per open time, oldest first.
-    by_open = {
-      dto.open_time_ms: dto
-      for dto in (
-        BinanceKlineDTO.from_rest_row(
-          row, symbol=symbol, interval=interval, now_ms=now_ms
-        )
-        for row in rows
-      )
-    }
-    closed = [
-      by_open[open_ms] for open_ms in sorted(by_open) if by_open[open_ms].is_closed
-    ]
+    # One more than asked for on the first page: its newest row is dropped.
+    limit = min(count + 1, KLINES_LIMIT)
+    rows = await self._klines(symbol, interval, limit)
+    #: Closed klines by open time — which also collapses a row Binance repeats.
+    closed = self._closed_klines(rows, symbol=symbol, timeframe=timeframe)
+    while len(closed) < count and len(rows) >= limit:
+      oldest_ms = min(int(row[0]) for row in rows)
+      limit = min(count - len(closed), KLINES_LIMIT)
+      rows = await self._klines(symbol, interval, limit, end_time_ms=oldest_ms - 1)
+      before = len(closed)
+      for open_ms, kline in self._klines_by_open(rows, symbol, interval).items():
+        closed.setdefault(open_ms, kline)
+      if len(closed) == before:
+        # A page that added nothing would be asked for again, forever.
+        break
     # Trimmed from the newest end: a venue that hands back more rows than asked
     # must not widen the window the subscriber asked for.
-    bars = [kline.to_bar(timeframe) for kline in closed[-count:]]
+    bars = [closed[open_ms].to_bar(timeframe) for open_ms in sorted(closed)[-count:]]
     if not bars:
       raise HistoryUnavailableError(
         f"Binance returned no closed bar for {symbol} {timeframe.value}"
@@ -202,6 +200,47 @@ class BinanceIngestion(AsyncStreamIngestion):
       bars[-1].open_time.isoformat(),
     )
     return bars
+
+  async def _klines(
+    self, symbol: str, interval: str, limit: int, *, end_time_ms: int | None = None
+  ) -> Sequence[Sequence[Any]]:
+    try:
+      return await self._history.klines(
+        symbol=symbol, interval=interval, limit=limit, end_time_ms=end_time_ms
+      )
+    except GatewayConnectionError as exc:
+      raise HistoryUnavailableError(str(exc)) from exc
+
+  @staticmethod
+  def _klines_by_open(
+    rows: Sequence[Sequence[Any]], symbol: str, interval: str
+  ) -> dict[int, BinanceKlineDTO]:
+    """Rows from a page that ends before the newest bar: every one is closed."""
+    klines = (
+      BinanceKlineDTO.from_rest_row(
+        row, symbol=symbol, interval=interval, is_closed=True
+      )
+      for row in rows
+    )
+    return {kline.open_time_ms: kline for kline in klines}
+
+  def _closed_klines(
+    self, rows: Sequence[Sequence[Any]], *, symbol: str, timeframe: Timeframe
+  ) -> dict[int, BinanceKlineDTO]:
+    """The closed klines of the newest page: all but the bar still forming.
+
+    The newest row is the forming bar — unless it ended a whole interval ago
+    or more, which only a symbol that stopped trading leaves as its newest
+    row. A full interval is far beyond any drift this host's clock can have,
+    so that test never mistakes a bar still forming for a closed one.
+    """
+    by_open = self._klines_by_open(rows, symbol, TIMEFRAME_INTERVALS[timeframe])
+    if by_open:
+      newest_ms = max(by_open)
+      now_ms = int(utcnow().timestamp() * 1000)
+      if newest_ms + 2 * timeframe.seconds * 1000 > now_ms:
+        del by_open[newest_ms]
+    return by_open
 
   def _warn_once(self, key: str, message: str, *args: Any) -> None:
     if key in self._unknown:

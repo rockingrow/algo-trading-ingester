@@ -117,6 +117,52 @@ async def test_initialize_failure_keeps_retrying(terminal):
   assert sum("disconnected" in m for m in notifier.messages) == 1
 
 
+async def test_a_terminal_cut_off_from_its_server_is_not_running(terminal):
+  # initialize() attaches to a running terminal whether or not it reaches its
+  # trade server; only the latter is a live feed.
+  terminal.connected = False
+  ingestion, _, notifier = make_ingestion(terminal, RECONNECT_INTERVAL_SECONDS=0.5)
+  await ingestion.start()
+  await wait_for(lambda: ingestion.status is GatewayStatusEnum.DISCONNECTED)
+  await asyncio.sleep(0.3)
+  await ingestion.stop()
+
+  # One attempt, then a wait of the reconnect interval — not a loop.
+  assert terminal.initialize_calls == 1
+  assert not any("gateway running" in message for message in notifier.messages)
+
+
+async def test_a_lost_server_connection_waits_before_dialling_again(terminal):
+  ingestion, _, notifier = make_ingestion(terminal, RECONNECT_INTERVAL_SECONDS=0.5)
+  await ingestion.start()
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
+  dialled = terminal.initialize_calls
+
+  terminal.connected = False
+  await wait_for(lambda: ingestion.status is GatewayStatusEnum.DISCONNECTED)
+  await asyncio.sleep(0.3)
+  redialled = terminal.initialize_calls - dialled
+  await ingestion.stop()
+
+  # Before the fix this loop dialled thousands of times a second and flipped
+  # running ↔ disconnected, with a notification, on every turn.
+  assert redialled == 0
+  assert sum("gateway disconnected" in m for m in notifier.messages) == 1
+
+
+async def test_history_is_answered_while_waiting_to_reconnect(terminal):
+  ingestion, _, _ = make_ingestion(terminal, RECONNECT_INTERVAL_SECONDS=5.0)
+  await ingestion.start()
+  await wait_for(lambda: ("XAUUSD", M1) in ingestion._open_marks)
+  terminal.connected = False
+  await wait_for(lambda: ingestion.status is GatewayStatusEnum.DISCONNECTED)
+
+  # Answered from the idle wait at once, not after the 5 s reconnect interval.
+  with pytest.raises(HistoryUnavailableError):
+    await asyncio.wait_for(ingestion.fetch_history("XAUUSD", M1, 5), timeout=1.0)
+  await ingestion.stop()
+
+
 async def test_unknown_symbol_is_skipped_not_fatal(terminal):
   ingestion, publisher, _ = make_ingestion(terminal, SYMBOLS=["NOPE", "XAUUSD"])
   await ingestion.start()

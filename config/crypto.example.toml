@@ -30,8 +30,9 @@ ws_url = "wss://stream.binance.com:9443/stream"
 # The websocket only carries bars that close while it is connected, so the bars
 # that closed before this process started are never published. A subscriber
 # that needs them asks, naming the symbol, the timeframe and how many, and is
-# answered from the REST klines endpoint below — at most 999 closed bars per
-# request, Binance's own limit less the bar still forming.
+# answered from the REST klines endpoint below, page by page (Binance returns at
+# most 1000 rows a call) up to NATS_HISTORY_MAX_BARS, never with the bar still
+# forming.
 #
 # The full REST klines endpoint a history request reads. Its path differs per
 # product, so it is written out rather than derived from ws_url:

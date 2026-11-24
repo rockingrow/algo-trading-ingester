@@ -124,17 +124,25 @@ class FakeKlineHistory:
   def __init__(self, rows: dict[tuple[str, str], list] | None = None) -> None:
     self.rows: dict[tuple[str, str], list] = dict(rows or {})
     self.calls: list[tuple[str, str, int]] = []
+    #: The ``end_time_ms`` of each call, in the same order as :attr:`calls`.
+    self.end_times: list[int | None] = []
     #: Raised by every :meth:`klines` call while it is set.
     self.error: Exception | None = None
 
   def set_rows(self, symbol: str, interval: str, rows: list) -> None:
     self.rows[(symbol, interval)] = list(rows)
 
-  async def klines(self, *, symbol: str, interval: str, limit: int) -> list:
+  async def klines(
+    self, *, symbol: str, interval: str, limit: int, end_time_ms: int | None = None
+  ) -> list:
     self.calls.append((symbol, interval, limit))
+    self.end_times.append(end_time_ms)
     if self.error is not None:
       raise self.error
-    return list(self.rows.get((symbol, interval), []))[-limit:]
+    rows = list(self.rows.get((symbol, interval), []))
+    if end_time_ms is not None:
+      rows = [row for row in rows if row[0] <= end_time_ms]
+    return rows[-limit:]
 
 
 class FakeKlineStream:

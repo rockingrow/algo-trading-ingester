@@ -79,7 +79,7 @@ def test_negative_volume_is_rejected():
 def test_a_rest_row_becomes_the_same_bar_as_a_websocket_kline():
   row = rest_kline(T0_MS, price=100.0, interval_ms=900_000)
   dto = BinanceKlineDTO.from_rest_row(
-    row, symbol="BTCUSDT", interval="15m", now_ms=T0_MS + 900_000
+    row, symbol="BTCUSDT", interval="15m", is_closed=True
   )
   assert dto.symbol == "BTCUSDT"
   assert dto.timeframe is Timeframe.M15
@@ -94,25 +94,24 @@ def test_a_rest_row_becomes_the_same_bar_as_a_websocket_kline():
   assert bar.spread is None
 
 
-def test_a_rest_row_is_closed_only_once_now_is_past_its_close_time():
+def test_a_rest_row_is_closed_when_its_caller_says_so():
   row = rest_kline(T0_MS, interval_ms=900_000)
 
-  def closed_at(now_ms: int) -> bool:
+  def closed(is_closed: bool) -> bool:
     return BinanceKlineDTO.from_rest_row(
-      row, symbol="BTCUSDT", interval="15m", now_ms=now_ms
+      row, symbol="BTCUSDT", interval="15m", is_closed=is_closed
     ).is_closed
 
-  # REST carries no "x" flag, so the bar still forming is recognised by time.
-  assert closed_at(T0_MS + 1) is False
-  # Binance's close time is the bar's last millisecond.
-  assert closed_at(T0_MS + 900_000 - 1) is False
-  assert closed_at(T0_MS + 900_000) is True
+  # REST carries no "x" flag, and the row alone cannot tell: the caller knows
+  # whether it was the newest row of the response, the bar still forming.
+  assert closed(True) is True
+  assert closed(False) is False
 
 
 def test_a_truncated_rest_row_is_rejected():
   with pytest.raises(ValueError, match="field"):
     BinanceKlineDTO.from_rest_row(
-      [T0_MS, "1.0"], symbol="BTCUSDT", interval="15m", now_ms=T0_MS
+      [T0_MS, "1.0"], symbol="BTCUSDT", interval="15m", is_closed=True
     )
 
 
@@ -120,7 +119,7 @@ def test_an_impossible_rest_row_is_rejected():
   row = rest_kline(T0_MS)
   row[2] = "1.0"  # high below the open
   dto = BinanceKlineDTO.from_rest_row(
-    row, symbol="BTCUSDT", interval="1m", now_ms=T0_MS + 60_000
+    row, symbol="BTCUSDT", interval="1m", is_closed=True
   )
   with pytest.raises(ValidationError, match="high"):
     dto.to_bar(Timeframe.M1)

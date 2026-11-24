@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from ingester.core.errors import (
@@ -282,13 +284,78 @@ async def test_history_never_returns_more_than_was_asked_for():
   ]
 
 
-async def test_history_is_capped_at_one_klines_request():
+async def test_a_short_first_page_ends_the_read():
   history = FakeKlineHistory({("BTCUSDT", "1m"): [rest_kline(T0_MS)]})
   ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
 
   await ingestion.fetch_history("BTCUSDT", M1, 5000)
 
+  # One request at Binance's own cap; it came back short, so there is no more.
   assert history.calls == [("BTCUSDT", "1m", 1000)]
+
+
+async def test_history_past_one_klines_request_is_read_page_by_page():
+  first_ms = T0_MS - 2_499 * 60_000
+  rows = [rest_kline(first_ms + step * 60_000) for step in range(2_500)]
+  history = FakeKlineHistory({("BTCUSDT", "1m"): rows})
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
+
+  _, bars = await ingestion.fetch_history("BTCUSDT", M1, 2_200)
+
+  opens = [int(bar.open_time.timestamp() * 1000) for bar in bars]
+  # Every bar asked for — not one klines request's worth — newest last, with
+  # no gap and no repeat where two pages meet.
+  assert len(bars) == 2_200
+  assert opens == sorted(set(opens))
+  assert opens[-1] == T0_MS
+  assert opens[-1] - opens[0] == 2_199 * 60_000
+  assert [limit for _, _, limit in history.calls] == [1000, 1000, 200]
+  # Each page ends just before the oldest row already held.
+  assert history.end_times[0] is None
+  assert history.end_times == [
+    None,
+    T0_MS - 999 * 60_000 - 1,
+    T0_MS - 1_999 * 60_000 - 1,
+  ]
+
+
+async def test_history_stops_where_the_venue_runs_out():
+  rows = [rest_kline(T0_MS + step * 60_000) for step in range(1_500)]
+  history = FakeKlineHistory({("BTCUSDT", "1m"): rows})
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
+
+  _, bars = await ingestion.fetch_history("BTCUSDT", M1, 5_000)
+
+  assert len(bars) == 1_500
+  assert len(history.calls) == 2
+
+
+async def test_the_forming_bar_is_dropped_even_when_this_host_clock_runs_fast(
+  monkeypatch,
+):
+  # The host cannot sync NTP, so its clock drifts. A clock a few seconds fast
+  # must not turn the bar still forming into a "closed" one.
+  forming_open_ms = int(utcnow().timestamp() * 1000) // 60_000 * 60_000
+  # Five seconds past the forming bar's close, by this host's fast clock.
+  fast_now = datetime.fromtimestamp((forming_open_ms + 65_000) / 1000, tz=UTC)
+  history = FakeKlineHistory(
+    {
+      ("BTCUSDT", "1m"): [
+        rest_kline(forming_open_ms - 60_000),
+        rest_kline(forming_open_ms),
+      ]
+    }
+  )
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
+  monkeypatch.setattr(
+    "ingester.gateways.crypto.binance.ingestion.utcnow", lambda: fast_now
+  )
+
+  _, bars = await ingestion.fetch_history("BTCUSDT", M1, 5)
+
+  assert [int(bar.open_time.timestamp() * 1000) for bar in bars] == [
+    forming_open_ms - 60_000
+  ]
 
 
 async def test_history_may_ask_for_a_timeframe_that_is_not_on_the_socket():
