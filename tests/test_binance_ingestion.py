@@ -311,7 +311,6 @@ async def test_history_past_one_klines_request_is_read_page_by_page():
   assert opens[-1] - opens[0] == 2_199 * 60_000
   assert [limit for _, _, limit in history.calls] == [1000, 1000, 200]
   # Each page ends just before the oldest row already held.
-  assert history.end_times[0] is None
   assert history.end_times == [
     None,
     T0_MS - 999 * 60_000 - 1,
@@ -356,6 +355,53 @@ async def test_the_forming_bar_is_dropped_even_when_this_host_clock_runs_fast(
   assert [int(bar.open_time.timestamp() * 1000) for bar in bars] == [
     forming_open_ms - 60_000
   ]
+
+
+async def test_the_newest_row_is_kept_when_it_closed_long_ago():
+  # A symbol that stopped trading has no bar forming, so its newest row is a
+  # closed bar and must not be mistaken for one.
+  history = FakeKlineHistory(
+    {("BTCUSDT", "1m"): [rest_kline(T0_MS - 60_000), rest_kline(T0_MS)]}
+  )
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
+
+  _, bars = await ingestion.fetch_history("BTCUSDT", M1, 5)
+
+  assert [int(bar.open_time.timestamp() * 1000) for bar in bars] == [
+    T0_MS - 60_000,
+    T0_MS,
+  ]
+
+
+async def test_a_page_that_repeats_bars_already_read_is_refused():
+  # A venue ignoring end_time_ms hands back the same page forever. Answering
+  # with what we hold would read as "this is all the history there is".
+  rows = [rest_kline(T0_MS - step * 60_000) for step in range(1_000)]
+  history = FakeKlineHistory({("BTCUSDT", "1m"): rows})
+
+  async def klines(*, symbol, interval, limit, end_time_ms=None):
+    history.calls.append((symbol, interval, limit))
+    return rows[-limit:]
+
+  history.klines = klines
+  ingestion, _, _ = make_ingestion(FakeKlineStream(), history)
+
+  with pytest.raises(HistoryUnavailableError, match="already read"):
+    await ingestion.fetch_history("BTCUSDT", M1, 2_000)
+
+
+async def test_a_read_that_outruns_its_budget_is_refused():
+  rows = [rest_kline(T0_MS - step * 60_000) for step in range(3_000)]
+  history = FakeKlineHistory({("BTCUSDT", "1m"): rows})
+  ingestion, _, _ = make_ingestion(
+    FakeKlineStream(), history, HISTORY_BUDGET_SECONDS=0.001
+  )
+
+  # Refused with the count read so far, not left for the subscriber to time
+  # out on NATS_HISTORY_TIMEOUT.
+  with pytest.raises(HistoryUnavailableError, match="ask for fewer"):
+    await ingestion.fetch_history("BTCUSDT", M1, 3_000)
+  assert len(history.calls) == 1
 
 
 async def test_history_may_ask_for_a_timeframe_that_is_not_on_the_socket():

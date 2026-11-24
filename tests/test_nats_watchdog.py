@@ -6,6 +6,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from nats.js.errors import NotFoundError
 
 from ingester.services.nats_service import NatsConnection, ReconnectWatchdog
 from ingester.settings import NatsSettings
@@ -282,18 +283,25 @@ async def test_error_callback_names_the_exception_type(caplog):
 
 class _BrokenStreamClient:
   """A client that connects but cannot have its stream created, and fires the
-  disconnected callback from ``close()`` as nats-py does."""
+  disconnected callback from ``close()`` as nats-py does.
 
-  def __init__(self, disconnected_cb) -> None:
+  *info_error* is what ``stream_info`` raises: ``NotFoundError`` for a server
+  with no such stream, anything else for a read that simply did not answer.
+  """
+
+  def __init__(self, disconnected_cb, info_error: Exception | None = None) -> None:
     self.is_connected = True
     self.closed = False
+    self.add_stream_calls = 0
+    self._info_error = info_error or NotFoundError()
     self._disconnected_cb = disconnected_cb
 
   def jetstream(self):
     async def stream_info(name):
-      raise RuntimeError("stream not found")
+      raise self._info_error
 
     async def add_stream(config):
+      self.add_stream_calls += 1
       raise RuntimeError("JetStream not enabled")
 
     return SimpleNamespace(stream_info=stream_info, add_stream=add_stream)
@@ -306,17 +314,22 @@ class _BrokenStreamClient:
 
 @pytest.fixture
 def broken_stream_server(monkeypatch):
-  clients: list[_BrokenStreamClient] = []
+  """A NATS server whose stream cannot be set up.
+
+  ``clients`` collects every client dialled; ``info_error`` is what
+  ``stream_info`` raises, which a test sets before connecting.
+  """
+  server = SimpleNamespace(clients=[], info_error=None)
 
   async def connect(**options):
-    client = _BrokenStreamClient(options["disconnected_cb"])
-    clients.append(client)
+    client = _BrokenStreamClient(options["disconnected_cb"], server.info_error)
+    server.clients.append(client)
     return client
 
   monkeypatch.setattr("ingester.services.nats_service.nats_lib.connect", connect)
   # The retry cadence is floored for production; a test does not wait it out.
   monkeypatch.setattr("ingester.services.nats_service._MIN_WATCHDOG_INTERVAL", 0.01)
-  return clients
+  return server
 
 
 async def test_a_client_whose_stream_cannot_be_set_up_is_closed_not_leaked(
@@ -334,8 +347,29 @@ async def test_a_client_whose_stream_cannot_be_set_up_is_closed_not_leaked(
   await connection.close()
 
   assert retry is not None
-  assert len(broken_stream_server) >= 3
-  assert all(client.closed for client in broken_stream_server)
+  assert len(broken_stream_server.clients) >= 3
+  assert all(client.closed for client in broken_stream_server.clients)
   assert not connection.is_connected
   # Closed on purpose, so not reported to operators as an outage.
   assert not any("disconnected" in message.lower() for message in notifier.messages)
+
+
+async def test_a_stream_that_cannot_be_read_keeps_the_connection(
+  broken_stream_server,
+):
+  # The live host's link stalls for tens of seconds at a time, so stream_info
+  # times out on a stream that is perfectly there. Creating it blind would
+  # fail on "already in use" and throw a working connection away — and the
+  # watchdog would stop the service over it.
+  broken_stream_server.info_error = TimeoutError()
+  connection, notifier, stops, _ = make_connection(
+    JETSTREAM_ENABLED=True, RECONNECT_TIME_WAIT=0.01
+  )
+
+  await connection.connect()
+
+  assert connection.is_connected
+  assert broken_stream_server.clients[0].add_stream_calls == 0
+  assert connection._connect_retry_task is None
+  assert stops == []
+  await connection.close()

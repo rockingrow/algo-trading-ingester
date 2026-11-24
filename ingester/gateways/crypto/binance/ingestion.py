@@ -17,6 +17,10 @@ bars Binance marks closed.
   so the bars that closed before this process started are not published. A
   subscriber that needs them asks (:meth:`BinanceIngestion._read_history`) and
   is answered from the REST klines endpoint, in one reply.
+* **History**: a request for more bars than one klines call returns is read
+  page by page, and refused rather than answered short — the reply has no way
+  to say it was cut off, so a short window would read as the whole of the
+  venue's history.
 * **De-duplication**: a reconnect can replay the bar that closed while the
   socket was down, and Binance occasionally repeats a final update. The core
   remembers the newest open time already emitted per stream, so each bar is
@@ -35,6 +39,7 @@ connect → receive → reconnect loop itself.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
@@ -160,29 +165,43 @@ class BinanceIngestion(AsyncStreamIngestion):
     socket. One klines request returns at most :data:`KLINES_LIMIT` rows, so a
     larger *count* is read page by page, newest first, each page ending just
     before the oldest row already held. Reading stops at *count*, or once a
-    page comes back short: the venue has no older bars.
+    page comes back short: the venue has no older bars, which is not
+    truncation and needs no saying.
 
-    Binance's newest row is the bar still forming. It is recognised by being
-    the newest row, not by its close time against this host's clock, which is
-    allowed to drift: a clock a few seconds fast would otherwise hand a
-    strategy a candle that is still moving.
+    A read that cannot be finished is **refused**, never answered short: the
+    reply carries no way to say "cut off", so fewer bars than asked would read
+    as "this is all the venue has" and leave a strategy on a window it thinks
+    is whole. Both ways out of a page loop are refusals — the pages taking
+    longer than ``history_budget_seconds``, and a page that repeats bars
+    already held, which is a venue ignoring ``endTime``.
     """
     interval = TIMEFRAME_INTERVALS[timeframe]
-    # One more than asked for on the first page: its newest row is dropped.
+    deadline = time.monotonic() + self._binance_config.HISTORY_BUDGET_SECONDS
+    # One more than asked for on the first page: its newest row is the bar
+    # still forming, which ``_closed_klines`` drops.
     limit = min(count + 1, KLINES_LIMIT)
     rows = await self._klines(symbol, interval, limit)
-    #: Closed klines by open time — which also collapses a row Binance repeats.
-    closed = self._closed_klines(rows, symbol=symbol, timeframe=timeframe)
+    # Closed klines by open time, which also collapses a row Binance repeats.
+    closed = self._closed_klines(rows, symbol=symbol, interval=interval)
     while len(closed) < count and len(rows) >= limit:
+      if time.monotonic() >= deadline:
+        raise HistoryUnavailableError(
+          f"Binance {symbol} {timeframe.value}: reading {count} bar(s) was still "
+          f"unfinished after {self._binance_config.HISTORY_BUDGET_SECONDS:.0f}s "
+          f"({len(closed)} read) — ask for fewer"
+        )
       oldest_ms = min(int(row[0]) for row in rows)
       limit = min(count - len(closed), KLINES_LIMIT)
       rows = await self._klines(symbol, interval, limit, end_time_ms=oldest_ms - 1)
-      before = len(closed)
-      for open_ms, kline in self._klines_by_open(rows, symbol, interval).items():
-        closed.setdefault(open_ms, kline)
-      if len(closed) == before:
-        # A page that added nothing would be asked for again, forever.
-        break
+      page = self._closed_klines(rows, symbol=symbol, interval=interval)
+      new = {open_ms: kline for open_ms, kline in page.items() if open_ms not in closed}
+      if not new and len(rows) >= limit:
+        raise HistoryUnavailableError(
+          f"Binance {symbol} {timeframe.value}: the page before {oldest_ms} came "
+          f"back with bars already read, so the window cannot be filled "
+          f"({len(closed)} of {count} bar(s))"
+        )
+      closed.update(new)
     # Trimmed from the newest end: a venue that hands back more rows than asked
     # must not widen the window the subscriber asked for.
     bars = [closed[open_ms].to_bar(timeframe) for open_ms in sorted(closed)[-count:]]
@@ -212,35 +231,41 @@ class BinanceIngestion(AsyncStreamIngestion):
       raise HistoryUnavailableError(str(exc)) from exc
 
   @staticmethod
-  def _klines_by_open(
-    rows: Sequence[Sequence[Any]], symbol: str, interval: str
-  ) -> dict[int, BinanceKlineDTO]:
-    """Rows from a page that ends before the newest bar: every one is closed."""
-    klines = (
-      BinanceKlineDTO.from_rest_row(
-        row, symbol=symbol, interval=interval, is_closed=True
-      )
-      for row in rows
-    )
-    return {kline.open_time_ms: kline for kline in klines}
-
   def _closed_klines(
-    self, rows: Sequence[Sequence[Any]], *, symbol: str, timeframe: Timeframe
+    rows: Sequence[Sequence[Any]], *, symbol: str, interval: str
   ) -> dict[int, BinanceKlineDTO]:
-    """The closed klines of the newest page: all but the bar still forming.
+    """The closed klines among *rows*, by open time.
 
-    The newest row is the forming bar — unless it ended a whole interval ago
-    or more, which only a symbol that stopped trading leaves as its newest
-    row. A full interval is far beyond any drift this host's clock can have,
-    so that test never mistakes a bar still forming for a closed one.
+    Keyed by open time, so a row Binance repeats collapses into one bar. REST
+    returns the bar still forming like any other and carries no ``x`` flag, so
+    a row is closed when either test says so: it is **not** the newest row of
+    the page — the one place Binance puts a forming bar — or its close time is
+    far enough past this host's clock to be sure of
+    (:data:`~ingester.gateways.crypto.binance.dto.CLOSED_BAR_TOLERANCE_MS`).
+
+    Neither test alone is enough. The clock is the only thing that can tell a
+    page whose newest row *is* closed — an older page, or a symbol whose last
+    bar is long past — and it drifts, so it is never what rules a bar closed
+    while the bar before it would do. The position is exact but says nothing
+    about the rows behind it, which are older than a forming bar and closed
+    whatever the clock reads.
     """
-    by_open = self._klines_by_open(rows, symbol, TIMEFRAME_INTERVALS[timeframe])
-    if by_open:
-      newest_ms = max(by_open)
-      now_ms = int(utcnow().timestamp() * 1000)
-      if newest_ms + 2 * timeframe.seconds * 1000 > now_ms:
-        del by_open[newest_ms]
-    return by_open
+    now_ms = int(utcnow().timestamp() * 1000)
+    by_open = {
+      kline.open_time_ms: kline
+      for kline in (
+        BinanceKlineDTO.from_rest_row(
+          row, symbol=symbol, interval=interval, now_ms=now_ms
+        )
+        for row in rows
+      )
+    }
+    newest_ms = max(by_open, default=None)
+    return {
+      open_ms: kline
+      for open_ms, kline in by_open.items()
+      if open_ms != newest_ms or kline.is_closed
+    }
 
   def _warn_once(self, key: str, message: str, *args: Any) -> None:
     if key in self._unknown:

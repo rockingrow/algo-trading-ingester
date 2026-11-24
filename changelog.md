@@ -27,10 +27,28 @@
 - **Binance history never hands out the bar still forming.** It used to be
   told apart by comparing its close time with this host's clock, which cannot
   sync NTP on the live deployment: a clock a few seconds fast returned the
-  forming candle as closed. The newest row is now taken as the forming bar
-  unless it ended a whole interval ago — which only a symbol that stopped
-  trading leaves behind. `BinanceKlineDTO.from_rest_row` takes `is_closed`
-  from its caller instead of a `now_ms`.
+  forming candle as closed. Two tests now have to agree — a row is closed when
+  it is not the newest of its page, the one place Binance puts a forming bar,
+  or when its own close time is at least `CLOSED_BAR_TOLERANCE_MS` (10 s) past
+  our clock. Neither alone is enough: the position says nothing about a page
+  whose newest row really is closed, and the clock drifts.
+- **A history read that cannot be finished is refused, not answered short.**
+  The reply has no way to say "cut off", so fewer bars than asked reads as
+  "this is all the venue has" and leaves a strategy on a window it thinks is
+  whole. New `history_budget_seconds` (default 15 s, under
+  `NATS_HISTORY_TIMEOUT`) bounds the page loop and refuses with the count read
+  so far — ask for fewer — rather than letting the subscriber time out; a page
+  that comes back with bars already read, a venue ignoring `endTime`, is
+  refused the same way. A page that is simply short still means the venue has
+  no older bars, which is not truncation.
+- **A JetStream stream that cannot be *read* no longer costs the connection.**
+  `_ensure_stream` swallowed every `stream_info` failure and created the
+  stream blind, which raises on the one that already exists — and with the
+  change above that discarded the connection and fed the give-up watchdog, so
+  a stalled read or a drifted stream config would stop the service within ten
+  minutes while every publish would have worked. Only a stream the server
+  answers `NotFoundError` for is created now; any other read failure is a
+  warning and the connection stands.
 
 ### Changed — the service runs in the foreground; backgrounding belongs to the host
 

@@ -373,6 +373,12 @@ class BinanceSettings(GatewaySettings):
   KLINES_URL: str = "https://api.binance.com/api/v3/klines"
   #: Seconds a single klines request may take.
   HTTP_TIMEOUT_SECONDS: float = 10.0
+  #: Seconds one history request may spend reading klines pages before it is
+  #: refused. More bars than one call returns (1000) are read page by page,
+  #: and the subscriber is waiting out ``NATS_HISTORY_TIMEOUT`` meanwhile:
+  #: keep this under that, so a read that cannot finish is refused with a
+  #: reason the caller can act on instead of leaving it to time out.
+  HISTORY_BUDGET_SECONDS: float = Field(default=15.0, gt=0)
   #: Seconds before a dropped socket is dialled again.
   RECONNECT_INTERVAL_SECONDS: float = 5.0
   #: Websocket keep-alive. Binance answers pings; a silent peer is dropped

@@ -45,6 +45,13 @@ klines_url = "https://api.binance.com/api/v3/klines"
 # Seconds a single klines request may take
 http_timeout_seconds = 10.0
 
+# Seconds one history request may spend reading klines pages before it is
+# refused. The subscriber is waiting out NATS_HISTORY_TIMEOUT meanwhile, so
+# keep this under it: a read that cannot finish is then refused with a reason
+# the caller can act on — ask for fewer bars — instead of timing out, and a
+# window is never answered short as if that were all the venue had.
+history_budget_seconds = 15.0
+
 # Seconds before a dropped socket is dialled again
 reconnect_interval_seconds = 5.0
 

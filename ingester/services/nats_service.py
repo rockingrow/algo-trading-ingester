@@ -41,6 +41,7 @@ import nats as nats_lib
 from nats.aio.client import Client as NATSClient
 from nats.js import JetStreamContext
 from nats.js import api as js_api
+from nats.js.errors import NotFoundError
 
 from ingester.helpers import messages
 from ingester.interfaces.notifier_protocol import Notifier
@@ -326,13 +327,31 @@ class NatsConnection:
       log.info("NATS connection closed")
 
   async def _ensure_stream(self) -> None:
-    """Create the stream if absent; never reconfigure one that exists."""
+    """Create the stream if absent; never reconfigure one that exists.
+
+    Only a stream the server says is **not there** is created. A read that
+    fails for any other reason — a timeout on a relayed link, which this
+    deployment sees several times an hour — leaves the question open, and
+    this returns rather than guessing: creating a stream blind would raise on
+    the one that already exists, and the caller discards the whole connection
+    over that. A stream that really is missing is reported by the first
+    publish instead.
+    """
     name = self._config.stream_name
     subjects = [f"{self._config.SUBJECT_PREFIX}.>"]
     try:
       info = await self.js.stream_info(name)
-    except Exception:
+    except NotFoundError:
       info = None
+    except Exception as exc:
+      log.warning(
+        "JetStream stream %s could not be read (%s); assuming it is there and "
+        "publishing to %s as configured",
+        name,
+        exc,
+        subjects[0],
+      )
+      return
     if info is not None:
       log.info("JetStream stream %s already exists", name)
       self._warn_stream_drift(info, subjects[0])
