@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Fixed — idempotency: a producer that never retried, and marks moved too early
+
+- **A publish that fails is retried** (`NATS_PUBLISH_RETRIES`, default 2,
+  `NATS_PUBLISH_RETRY_DELAY` apart) instead of being counted and dropped. The
+  whole de-duplication apparatus — a deterministic `event_id` riding as
+  `Nats-Msg-Id`, a `DUPLICATE_WINDOW_SECONDS` sized to cover a recovery read —
+  exists so that re-sending a bar is safe, and nothing ever re-sent one: the
+  pipeline was at-most-once, and on a link that stalls for tens of seconds
+  several times an hour every bar lost to a stall waited for a subscriber to
+  notice the gap and ask for history. Bounded, because the dispatcher's queue
+  is not: a NATS that stays down is still the watchdog's business.
+- **A duplicate is no longer counted as published.** JetStream acknowledges a
+  publish it already has and stores nothing, so no consumer is handed that
+  message; `/status` counted it among `published` all the same. It is now
+  `duplicates`, and `EventPublisher.publish` returns whether the transport
+  took the event.
+- **The Binance gateway moves a stream's mark only once the bar is away.** It
+  remembered the open time *before* building the bar, so a candle the schema
+  refuses — an impossible high — advanced the mark and the corrected update
+  Binance sends next read as a bar already published: the close was lost for
+  good. The MT5 gateway had the order right; both now emit, then remember.
+- **A history responder that cannot subscribe for every gateway subscribes for
+  none.** A `subscribe` that failed partway left the earlier gateways
+  subscribed, every gateway announced as online, and the reconnect hook taking
+  its "already subscribed" branch for good — so the gateways that missed out
+  were advertised as answering and a caller could only find out by timing out.
+  `start` now rolls back and the reconnect replays the whole set.
+- **A gateway whose thread will not stop is not started again.**
+  `ThreadedIngestion` cleared one shared stop event on start, which would wake
+  a thread still inside a venue call back up and leave two threads sharing one
+  process-global MetaTrader5 session. The restart is refused instead, and the
+  thread handle is kept so it can be.
+- **The `online` announcement is documented as idempotent.** It repeats on
+  every reconnect — several times an hour on a relayed link — and carries
+  nothing new; a subscriber that re-requests every window on each one turns a
+  flapping link into a stream of venue reads.
+
 ### Fixed — a reconnect loop with no pause, a leaked NATS client, short or unfinished Binance history
 
 - **MT5 no longer redials in a loop with no pause.** When a poll found the

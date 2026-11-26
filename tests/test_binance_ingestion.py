@@ -98,6 +98,25 @@ async def test_a_bar_still_forming_is_never_published():
   assert int(event.bar.open_time.timestamp()) == (T0_MS + 60_000) // 1000
 
 
+async def test_a_candle_the_schema_refuses_can_still_arrive_corrected():
+  # Binance sends a close whose high is below its open: Bar refuses it. The
+  # stream's mark must not have moved, or the corrected update that follows
+  # reads as a bar already published and the close is lost for good.
+  broken = kline(T0_MS)
+  broken["data"]["k"]["h"] = "1.0"
+  stream = FakeKlineStream([broken])
+  ingestion, publisher, _ = make_ingestion(stream)
+  await ingestion.start()
+  await wait_for(lambda: stream.opened)
+  await wait_for(lambda: ingestion.status is GatewayStatusEnum.RUNNING)
+
+  stream.push(kline(T0_MS))
+  await wait_for(lambda: len(publisher.events) == 1)
+  await ingestion.stop()
+
+  assert int(publisher.events[0].bar.open_time.timestamp() * 1000) == T0_MS
+
+
 async def test_a_repeated_close_is_published_once():
   stream = FakeKlineStream([kline(T0_MS), kline(T0_MS), kline(T0_MS + 60_000)])
   ingestion, publisher, _ = make_ingestion(stream)

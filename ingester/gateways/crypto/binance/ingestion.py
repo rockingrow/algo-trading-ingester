@@ -151,8 +151,13 @@ class BinanceIngestion(AsyncStreamIngestion):
     if not self._is_new_bar(symbol, timeframe, kline.open_time_ms):
       log.debug("Binance %s %s repeated bar, skipped", symbol, timeframe.value)
       return
+    # The bar is built and handed over *before* the stream's mark moves. The
+    # other order loses the bar for good when ``to_bar`` refuses the candle —
+    # an impossible high, say: the mark would already have passed it, so the
+    # corrected update Binance sends next reads as a bar we have had.
+    bar = kline.to_bar(timeframe)
+    self.emit_bar(symbol, timeframe, bar)
     self._remember_bar(symbol, timeframe, kline.open_time_ms)
-    self.emit_bar(symbol, timeframe, kline.to_bar(timeframe))
 
   # ── History, on request ───────────────────────────────────────────
 

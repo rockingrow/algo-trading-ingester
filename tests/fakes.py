@@ -18,11 +18,24 @@ class FakePublisher:
     self.subject_filter = "TEST.>"
     #: Raised instead of publishing while set, for the failure paths.
     self.fail_with: Exception | None = None
+    #: How many of the next attempts :attr:`fail_with` applies to, so a test
+    #: can let a retry through without racing the dispatcher. ``None`` leaves
+    #: it applying to every attempt.
+    self.fail_times: int | None = None
+    #: Returned by :meth:`publish` — ``False`` is a broker that acknowledged
+    #: the write and stored nothing, having seen this ``event_id`` already.
+    self.stored = True
+    #: Every attempt, failures included: what a retry is counted by.
+    self.attempts: list[MarketEvent] = []
 
-  async def publish(self, event: MarketEvent) -> None:
-    if self.fail_with is not None:
+  async def publish(self, event: MarketEvent) -> bool:
+    self.attempts.append(event)
+    if self.fail_with is not None and (self.fail_times is None or self.fail_times > 0):
+      if self.fail_times is not None:
+        self.fail_times -= 1
       raise self.fail_with
     self.events.append(event)
+    return self.stored
 
 
 class FakeNotifier:

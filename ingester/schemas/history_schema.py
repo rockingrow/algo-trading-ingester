@@ -82,6 +82,16 @@ class OnlineAnnouncement(BaseModel):
   Core NATS, not persisted — a subscriber that was not listening when it was
   said finds out the other way, by asking: with no ingester subscribed NATS
   answers *no responders* at once.
+
+  **It repeats, and a repeat carries nothing new.** It is said on every
+  re-established NATS connection, and on the live deployment that link is
+  relayed and drops several times an hour, so this arrives that often with
+  ``reason: "reconnected"`` while the ingester never stopped ingesting. A
+  subscriber has to treat it idempotently — check which of its windows are
+  actually short and ask only for those. One that re-requests every window on
+  every announcement turns a flapping link into a stream of history requests,
+  each of them a venue read, and on the MT5 gateway those run on the thread
+  that is detecting bar closes.
   """
 
   model_config = ConfigDict(frozen=True)

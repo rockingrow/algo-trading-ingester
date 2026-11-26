@@ -48,6 +48,7 @@ bars and answering no request until a restart.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from typing import Any
 
 from nats.aio.msg import Msg
@@ -103,18 +104,31 @@ class HistoryResponder:
     the same set.
     """
     self._ingestions = list(ingestions)
-    for ingestion in ingestions:
-      subject = self.subject_for(ingestion)
-      queue = self.queue_for(ingestion)
+    subscriptions: list[Any] = []
+    try:
+      for ingestion in ingestions:
+        subject = self.subject_for(ingestion)
+        queue = self.queue_for(ingestion)
 
-      async def handle(message: Msg, ingestion: Ingestion = ingestion) -> None:
-        await self._on_request(ingestion, message)
+        async def handle(message: Msg, ingestion: Ingestion = ingestion) -> None:
+          await self._on_request(ingestion, message)
 
-      subscription = await self._connection.nc.subscribe(
-        subject, queue=queue, cb=handle
-      )
-      self._subscriptions.append(subscription)
-      log.info("History requests served on %s (queue=%s)", subject, queue)
+        subscription = await self._connection.nc.subscribe(
+          subject, queue=queue, cb=handle
+        )
+        subscriptions.append(subscription)
+        log.info("History requests served on %s (queue=%s)", subject, queue)
+    except Exception:
+      # All or nothing. Kept, a part-subscribed responder is the worst of both:
+      # the announcement below names every gateway, and the reconnect hook
+      # takes its "already subscribed" branch, so the gateways that missed out
+      # are advertised as online for good while answering nothing — and a
+      # caller can only tell by timing out.
+      for subscription in subscriptions:
+        with suppress(Exception):
+          await subscription.unsubscribe()
+      raise
+    self._subscriptions = subscriptions
     # The server has to know about the subscriptions before anyone is told to
     # use them, or the first request an announcement provokes finds nobody.
     await self._connection.nc.flush()

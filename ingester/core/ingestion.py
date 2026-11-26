@@ -98,12 +98,16 @@ class BaseIngestion(ABC):
     notifier: Notifier,
     instance_id: str,
     drain_timeout: float = 5.0,
+    publish_attempts: int = 3,
+    publish_retry_delay: float = 1.0,
   ) -> None:
     self._config = config
     self._publisher = publisher
     self._notifier = notifier
     self._instance_id = instance_id
     self._drain_timeout = drain_timeout
+    self._publish_attempts = max(1, publish_attempts)
+    self._publish_retry_delay = publish_retry_delay
     self._source = EventSource(
       gateway=self.gateway, market=config.MARKET, ingester_id=instance_id
     )
@@ -116,6 +120,10 @@ class BaseIngestion(ABC):
     # Stats, surfaced by ``snapshot`` for the /status endpoint.
     self._published = 0
     self._failed = 0
+    #: Events the broker acknowledged and stored nothing for, because it had
+    #: this ``event_id`` already. Counted apart from ``published``: no
+    #: subscriber is handed one, so it must not read as a bar delivered.
+    self._duplicates = 0
     self._last_published_at: datetime | None = None
     self._last_error: str | None = None
     #: Error class of the last failed publish, so a run of identical failures
@@ -195,6 +203,7 @@ class BaseIngestion(ABC):
       "timeframes": [tf.value for tf in self.timeframes],
       "published": self._published,
       "failed": self._failed,
+      "duplicates": self._duplicates,
       "last_published_at": (
         self._last_published_at.isoformat() if self._last_published_at else None
       ),
@@ -352,8 +361,11 @@ class BaseIngestion(ABC):
     while True:
       event = await self._queue.get()
       try:
-        await self._publisher.publish(event)
-        self._published += 1
+        stored = await self._publish(event)
+        if stored:
+          self._published += 1
+        else:
+          self._duplicates += 1
         # A publish that worked ends the run, so the next failure is reported
         # at ERROR even when it is the same kind as the last one.
         self._last_error_type = None
@@ -367,6 +379,42 @@ class BaseIngestion(ABC):
         self._report_publish_error(event, exc)
       finally:
         self._queue.task_done()
+
+  async def _publish(self, event: MarketEvent) -> bool:
+    """Publish *event*, retrying a failure a bounded number of times.
+
+    A failed publish is the one thing in this pipeline worth retrying. The
+    bar is already closed and gone from the venue's push: drop it here and it
+    is missing until a subscriber notices the gap and asks for history.
+    Retrying costs nothing in correctness because ``event_id`` is
+    deterministic — it is the subscriber's de-duplication key and JetStream's
+    ``Nats-Msg-Id``, so a bar that did land after all is dropped on the other
+    side rather than traded twice.
+
+    Bounded, because the queue feeding this is not: a NATS that stays
+    unreachable is the watchdog's business, not this loop's. Returns whether
+    the broker stored the event — ``False`` for one it already had.
+    """
+    for attempt in range(1, self._publish_attempts + 1):
+      try:
+        return await self._publisher.publish(event)
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        if attempt == self._publish_attempts:
+          raise
+        log.warning(
+          "Publishing %s failed (%s: %s), attempt %d of %d; retrying in %.1fs",
+          event.event_id,
+          type(exc).__name__,
+          exc,
+          attempt,
+          self._publish_attempts,
+          self._publish_retry_delay,
+        )
+        if self._publish_retry_delay:
+          await asyncio.sleep(self._publish_retry_delay)
+    raise AssertionError("unreachable: the loop returns or raises")
 
   def _report_publish_error(self, event: MarketEvent, exc: Exception) -> None:
     """Log a failed publish: ERROR the first time, WARNING while it repeats.
@@ -582,7 +630,16 @@ class ThreadedIngestion(BaseIngestion):
   # ── BaseIngestion ─────────────────────────────────────────────────
 
   async def _start_source(self) -> None:
+    if self._thread is not None and self._thread.is_alive():
+      # The previous run's thread is still inside a venue call. Clearing the
+      # stop event now would wake it back up, and two threads would share one
+      # process-global SDK session — the MetaTrader5 case this class exists
+      # for. Refused instead, so the gateway reads as FAILED and says why.
+      raise GatewayConnectionError(
+        f"{self.gateway.value}: the previous ingestion thread has not stopped"
+      )
     self._stop_event.clear()
+    self._wake.clear()
     self._thread = threading.Thread(
       target=self._thread_main, name=f"{self.gateway.value}-ingestion", daemon=True
     )
@@ -594,9 +651,12 @@ class ThreadedIngestion(BaseIngestion):
     if self._thread is not None:
       await asyncio.to_thread(self._thread.join, self._join_timeout)
       if self._thread.is_alive():
+        # The handle is kept on purpose: it is the only thing that can stop a
+        # later ``start`` from running a second thread beside this one.
         log.warning(
           "%s thread did not stop within %.0fs", self.gateway.value, self._join_timeout
         )
+        return
       self._thread = None
 
   # ── Calls from the event loop ─────────────────────────────────────

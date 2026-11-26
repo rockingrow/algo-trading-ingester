@@ -31,6 +31,7 @@ process that retries silently for hours is worse than one that is plainly down.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -527,7 +528,7 @@ class NatsPublisher:
   def subject_for(self, event: MarketEvent) -> str:
     return ".".join((self._config.SUBJECT_PREFIX, *event.subject_tokens))
 
-  async def publish(self, event: MarketEvent) -> None:
+  async def publish(self, event: MarketEvent) -> bool:
     subject = self.subject_for(event)
     data = event.model_dump_json().encode()
     if self._config.JETSTREAM_ENABLED:
@@ -554,7 +555,7 @@ class NatsPublisher:
           ack.stream,
           ack.seq,
         )
-        return
+        return False
       log.info(
         "Published %s → %s (stream=%s seq=%s)",
         event.event_id,
@@ -565,4 +566,6 @@ class NatsPublisher:
     else:
       await self._connection.nc.publish(subject, data)
       log.info("Published %s → %s", event.event_id, subject)
-    log.debug("Published payload %s: %s", event.event_id, data.decode())
+    if log.isEnabledFor(logging.DEBUG):
+      log.debug("Published payload %s: %s", event.event_id, data.decode())
+    return True
