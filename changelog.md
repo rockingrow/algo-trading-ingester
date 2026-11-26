@@ -2,6 +2,106 @@
 
 ## Unreleased
 
+### Fixed — idempotency: a producer that never retried, and marks moved too early
+
+- **A publish that fails is retried** (`NATS_PUBLISH_RETRIES`, default 2,
+  `NATS_PUBLISH_RETRY_DELAY` apart) instead of being counted and dropped. The
+  whole de-duplication apparatus — a deterministic `event_id` riding as
+  `Nats-Msg-Id`, a `DUPLICATE_WINDOW_SECONDS` sized to cover a recovery read —
+  exists so that re-sending a bar is safe, and nothing ever re-sent one: the
+  pipeline was at-most-once, and on a link that stalls for tens of seconds
+  several times an hour every bar lost to a stall waited for a subscriber to
+  notice the gap and ask for history. Bounded, because the dispatcher's queue
+  is not: a NATS that stays down is still the watchdog's business.
+- **A duplicate is no longer counted as published.** JetStream acknowledges a
+  publish it already has and stores nothing, so no consumer is handed that
+  message; `/status` counted it among `published` all the same. It is now
+  `duplicates`, and `EventPublisher.publish` returns whether the transport
+  took the event.
+- **The Binance gateway moves a stream's mark only once the bar is away.** It
+  remembered the open time *before* building the bar, so a candle the schema
+  refuses — an impossible high — advanced the mark and the corrected update
+  Binance sends next read as a bar already published: the close was lost for
+  good. The MT5 gateway had the order right; both now emit, then remember.
+- **A history responder that cannot subscribe for every gateway subscribes for
+  none.** A `subscribe` that failed partway left the earlier gateways
+  subscribed, every gateway announced as online, and the reconnect hook taking
+  its "already subscribed" branch for good — so the gateways that missed out
+  were advertised as answering and a caller could only find out by timing out.
+  `start` now rolls back and the reconnect replays the whole set.
+- **A gateway whose thread will not stop is not started again.**
+  `ThreadedIngestion` cleared one shared stop event on start, which would wake
+  a thread still inside a venue call back up and leave two threads sharing one
+  process-global MetaTrader5 session. The restart is refused instead, and the
+  thread handle is kept so it can be.
+- **A duplicate no longer moves `last_published_at` either**, and `make status`
+  reports `duplicates` beside `published` as `/status` does. The timestamp is
+  what an operator reads to tell a quiet venue from a pipeline that stopped
+  delivering, so stamping it for a message no subscriber is handed hid the
+  failure it is there to show.
+- **Shutdown no longer spends the drain budget waiting to retry.**
+  `drain_timeout` is the budget for every bar still queued, and a publish that
+  failed sat out its whole `NATS_PUBLISH_RETRY_DELAY` inside it — so a stop
+  during a NATS outage flushed fewer bars than it had time for. The waits now
+  end when the drain begins and the remaining attempts run back to back.
+- **A second responder `start` drops what the first one subscribed.** Nothing
+  pointed at those subscriptions once the list was replaced, and they kept
+  answering: the queue group would hand a request to a responder the object no
+  longer knew it had. Not reachable through the reconnect hook, which only
+  starts when there are none.
+- **The `online` announcement is documented as idempotent.** It repeats on
+  every reconnect — several times an hour on a relayed link — and carries
+  nothing new; a subscriber that re-requests every window on each one turns a
+  flapping link into a stream of venue reads.
+
+### Fixed — a reconnect loop with no pause, a leaked NATS client, short or unfinished Binance history
+
+- **MT5 no longer redials in a loop with no pause.** When a poll found the
+  terminal cut off from its trade server, the gateway thread dialled again at
+  once. `initialize()` attaches to a running terminal regardless, so it
+  succeeded, the next poll failed and the loop went round again — thousands of
+  times a second against the fake terminal, flipping *running* ↔
+  *disconnected* with a Telegram message on every turn. The thread now waits
+  `reconnect_interval_seconds` after a lost connection (still answering
+  history requests meanwhile), and `connect` counts as done only once
+  the terminal reaches its trade server.
+- **A NATS client whose JetStream stream cannot be set up is closed.** It
+  used to stay open while the background retry dialled a new one, leaking a
+  live connection and its reconnect loop on every attempt. The failure is now
+  a `ConnectionError` like any other dial that failed: retried, and counted by
+  the give-up watchdog. The deliberate close does not notify *NATS
+  Disconnected*.
+- **Binance history is read page by page.** One klines request returns at
+  most 1000 rows, so a request for more came back with 999 bars and
+  `truncated: false`, which says the venue had no more. The gateway now pages
+  back with `endTime` until it has `count` bars or the venue runs out, up to
+  `NATS_HISTORY_MAX_BARS`.
+- **Binance history never hands out the bar still forming.** It used to be
+  told apart by comparing its close time with this host's clock, which cannot
+  sync NTP on the live deployment: a clock a few seconds fast returned the
+  forming candle as closed. Two tests now have to agree — a row is closed when
+  it is not the newest of its page, the one place Binance puts a forming bar,
+  or when its own close time is at least `CLOSED_BAR_TOLERANCE_MS` (10 s) past
+  our clock. Neither alone is enough: the position says nothing about a page
+  whose newest row really is closed, and the clock drifts.
+- **A history read that cannot be finished is refused, not answered short.**
+  The reply has no way to say "cut off", so fewer bars than asked reads as
+  "this is all the venue has" and leaves a strategy on a window it thinks is
+  whole. New `history_budget_seconds` (default 15 s, under
+  `NATS_HISTORY_TIMEOUT`) bounds the page loop and refuses with the count read
+  so far — ask for fewer — rather than letting the subscriber time out; a page
+  that comes back with bars already read, a venue ignoring `endTime`, is
+  refused the same way. A page that is simply short still means the venue has
+  no older bars, which is not truncation.
+- **A JetStream stream that cannot be *read* no longer costs the connection.**
+  `_ensure_stream` swallowed every `stream_info` failure and created the
+  stream blind, which raises on the one that already exists — and with the
+  change above that discarded the connection and fed the give-up watchdog, so
+  a stalled read or a drifted stream config would stop the service within ten
+  minutes while every publish would have worked. Only a stream the server
+  answers `NotFoundError` for is created now; any other read failure is a
+  warning and the connection stands.
+
 ### Changed — the service runs in the foreground; backgrounding belongs to the host
 
 - **`make start` is the blocking foreground run** (`uv run python -m

@@ -43,6 +43,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime
 from typing import Any, ClassVar
 
@@ -98,12 +99,16 @@ class BaseIngestion(ABC):
     notifier: Notifier,
     instance_id: str,
     drain_timeout: float = 5.0,
+    publish_attempts: int = 3,
+    publish_retry_delay: float = 1.0,
   ) -> None:
     self._config = config
     self._publisher = publisher
     self._notifier = notifier
     self._instance_id = instance_id
     self._drain_timeout = drain_timeout
+    self._publish_attempts = max(1, publish_attempts)
+    self._publish_retry_delay = publish_retry_delay
     self._source = EventSource(
       gateway=self.gateway, market=config.MARKET, ingester_id=instance_id
     )
@@ -112,10 +117,18 @@ class BaseIngestion(ABC):
     self._loop: asyncio.AbstractEventLoop | None = None
     self._queue: asyncio.Queue[MarketEvent] | None = None
     self._dispatcher: asyncio.Task[None] | None = None
+    #: Set while shutdown is draining the queue. The waits between publish
+    #: attempts end on it: ``drain_timeout`` is the budget for every bar still
+    #: queued, and one bar's retry waits would otherwise spend all of it.
+    self._draining = asyncio.Event()
     self._background: set[asyncio.Task[Any]] = set()
     # Stats, surfaced by ``snapshot`` for the /status endpoint.
     self._published = 0
     self._failed = 0
+    #: Events the broker acknowledged and stored nothing for, because it had
+    #: this ``event_id`` already. Counted apart from ``published``: no
+    #: subscriber is handed one, so it must not read as a bar delivered.
+    self._duplicates = 0
     self._last_published_at: datetime | None = None
     self._last_error: str | None = None
     #: Error class of the last failed publish, so a run of identical failures
@@ -156,6 +169,7 @@ class BaseIngestion(ABC):
 
     self._loop = asyncio.get_running_loop()
     self._queue = asyncio.Queue()
+    self._draining.clear()
     self._dispatcher = asyncio.create_task(
       self._dispatch_loop(), name=f"{self.gateway.value}-dispatcher"
     )
@@ -195,6 +209,7 @@ class BaseIngestion(ABC):
       "timeframes": [tf.value for tf in self.timeframes],
       "published": self._published,
       "failed": self._failed,
+      "duplicates": self._duplicates,
       "last_published_at": (
         self._last_published_at.isoformat() if self._last_published_at else None
       ),
@@ -352,13 +367,25 @@ class BaseIngestion(ABC):
     while True:
       event = await self._queue.get()
       try:
-        await self._publisher.publish(event)
-        self._published += 1
+        stored = await self._publish(event)
+        # ``is False`` on purpose. A publisher written against the older
+        # signature returns None, which means "sent, nothing to report" and
+        # not "the broker already had it": counted as a duplicate, every bar
+        # it delivers would read as one never delivered.
+        if stored is False:
+          self._duplicates += 1
+          log.debug("Duplicate %s: the broker already had it", event.event_id)
+        else:
+          self._published += 1
+          # Stamped for a bar a subscriber is handed, not for one the broker
+          # dropped — the same mis-reading that keeps duplicates out of
+          # ``published``, and an operator reads this line to tell a quiet
+          # venue from a pipeline that stopped delivering.
+          self._last_published_at = utcnow()
+          log.debug("Published %s", event.event_id)
         # A publish that worked ends the run, so the next failure is reported
         # at ERROR even when it is the same kind as the last one.
         self._last_error_type = None
-        self._last_published_at = utcnow()
-        log.debug("Published %s", event.event_id)
       except asyncio.CancelledError:
         raise
       except Exception as exc:
@@ -367,6 +394,62 @@ class BaseIngestion(ABC):
         self._report_publish_error(event, exc)
       finally:
         self._queue.task_done()
+
+  async def _publish(self, event: MarketEvent) -> bool:
+    """Publish *event*, retrying a failure a bounded number of times.
+
+    A failed publish is the one thing in this pipeline worth retrying. The
+    bar is already closed and gone from the venue's push: drop it here and it
+    is missing until a subscriber notices the gap and asks for history.
+    Retrying costs nothing in correctness because ``event_id`` is
+    deterministic — it is the subscriber's de-duplication key and JetStream's
+    ``Nats-Msg-Id``, so a bar that did land after all is dropped on the other
+    side rather than traded twice.
+
+    Bounded, because the queue feeding this is not: a NATS that stays
+    unreachable is the watchdog's business, not this loop's. Returns whether
+    the broker stored the event — ``False`` for one it already had.
+
+    **What de-duplicates depends on the deployment.** With JetStream enabled
+    the broker drops a repeat by ``Nats-Msg-Id`` and it is reported here as a
+    duplicate. With ``NATS_JETSTREAM_ENABLED=false`` — the default — nothing
+    does, so a retry after an *ambiguous* failure (the publish reached the
+    server and the acknowledgement did not) delivers the bar twice. That is
+    the contract being used as written rather than a hole in it: ``event_id``
+    is deterministic precisely so the subscriber can drop a repeat, and
+    ``qte-ingest`` does. A subscriber that cannot wants
+    ``NATS_PUBLISH_RETRIES=0`` and the at-most-once pipeline that comes with
+    it.
+
+    Shutdown skips the waits between attempts — see ``_draining``.
+    """
+    for attempt in range(1, self._publish_attempts + 1):
+      try:
+        return await self._publisher.publish(event)
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        if attempt == self._publish_attempts:
+          raise
+        log.warning(
+          "Publishing %s failed (%s: %s), attempt %d of %d; retrying in %.1fs",
+          event.event_id,
+          type(exc).__name__,
+          exc,
+          attempt,
+          self._publish_attempts,
+          self._publish_retry_delay,
+        )
+        if self._publish_retry_delay:
+          # Interruptible on purpose. A wait already running when shutdown
+          # begins would spend the drain budget on one bar's retry; ending it
+          # there leaves the remaining attempts back to back and the queue
+          # moving. A NATS that is really gone is the watchdog's business.
+          with suppress(TimeoutError):
+            await asyncio.wait_for(
+              self._draining.wait(), timeout=self._publish_retry_delay
+            )
+    raise AssertionError("unreachable: the loop returns or raises")
 
   def _report_publish_error(self, event: MarketEvent, exc: Exception) -> None:
     """Log a failed publish: ERROR the first time, WARNING while it repeats.
@@ -393,6 +476,7 @@ class BaseIngestion(ABC):
 
   async def _stop_dispatcher(self) -> None:
     """Give queued events a bounded chance to publish, then cancel."""
+    self._draining.set()
     # Let hand-offs a stopped thread scheduled via call_soon_threadsafe land in
     # the queue first — ``join`` returns at once on an empty queue.
     await asyncio.sleep(0)
@@ -582,7 +666,16 @@ class ThreadedIngestion(BaseIngestion):
   # ── BaseIngestion ─────────────────────────────────────────────────
 
   async def _start_source(self) -> None:
+    if self._thread is not None and self._thread.is_alive():
+      # The previous run's thread is still inside a venue call. Clearing the
+      # stop event now would wake it back up, and two threads would share one
+      # process-global SDK session — the MetaTrader5 case this class exists
+      # for. Refused instead, so the gateway reads as FAILED and says why.
+      raise GatewayConnectionError(
+        f"{self.gateway.value}: the previous ingestion thread has not stopped"
+      )
     self._stop_event.clear()
+    self._wake.clear()
     self._thread = threading.Thread(
       target=self._thread_main, name=f"{self.gateway.value}-ingestion", daemon=True
     )
@@ -594,9 +687,12 @@ class ThreadedIngestion(BaseIngestion):
     if self._thread is not None:
       await asyncio.to_thread(self._thread.join, self._join_timeout)
       if self._thread.is_alive():
+        # The handle is kept on purpose: it is the only thing that can stop a
+        # later ``start`` from running a second thread beside this one.
         log.warning(
           "%s thread did not stop within %.0fs", self.gateway.value, self._join_timeout
         )
+        return
       self._thread = None
 
   # ── Calls from the event loop ─────────────────────────────────────
@@ -667,9 +763,12 @@ class ThreadedIngestion(BaseIngestion):
           self._set_status(GatewayStatusEnum.DISCONNECTED, str(exc))
           self._safe_disconnect()
           connected = False
-          # Answer whoever is waiting before dialling again: the reconnect
-          # below may succeed and fail in a loop, and never reach an idle wait.
-          self._serve_calls(connected=False)
+          # Wait out the reconnect interval before dialling again — serving
+          # whoever is waiting meanwhile. Without it, a venue whose connect
+          # succeeds while its poll fails (an MT5 terminal that is up but cut
+          # off from its trade server) is dialled again at once, in a loop
+          # with no pause that flips the status, and notifies, on every turn.
+          self._idle(self._reconnect_interval, connected=False)
           continue
         except Exception:
           # A bug in one poll must not kill the feed; the next poll retries.

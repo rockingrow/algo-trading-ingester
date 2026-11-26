@@ -31,6 +31,7 @@ process that retries silently for hours is worse than one that is plainly down.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -41,6 +42,7 @@ import nats as nats_lib
 from nats.aio.client import Client as NATSClient
 from nats.js import JetStreamContext
 from nats.js import api as js_api
+from nats.js.errors import NotFoundError
 
 from ingester.helpers import messages
 from ingester.interfaces.notifier_protocol import Notifier
@@ -125,6 +127,8 @@ class NatsConnection:
     # Set while we close on purpose, so the drain's own disconnect callback is
     # not reported to operators as an outage.
     self._closing = False
+    # Set while a client that failed its set-up is closed, for the same reason.
+    self._discarding = False
     #: Called after every re-established connection, in registration order.
     self._reconnect_hooks: list[Callable[[], Awaitable[None]]] = []
     # How the connection stops the process once it has given up. Injected so
@@ -201,7 +205,7 @@ class NatsConnection:
     # nats-py applies max_reconnect_attempts to the first connect too, so -1
     # would hang forever against a dead server. Bound it: fail fast at boot.
     try:
-      self._nc = await asyncio.wait_for(
+      client = await asyncio.wait_for(
         nats_lib.connect(**options), timeout=self._config.CONNECT_TIMEOUT
       )
     except TimeoutError as exc:
@@ -215,10 +219,41 @@ class NatsConnection:
       raise ConnectionError(
         f"NATS at {self._config.url} is unreachable: {exc}"
       ) from exc
+    # A fresh client gets a fresh JetStream context: a cached one would still
+    # point at whichever client came before it.
+    self._nc, self._js = client, None
     log.info("NATS connected to %s", self._config.url)
 
-    if self._config.JETSTREAM_ENABLED:
+    if not self._config.JETSTREAM_ENABLED:
+      return
+    try:
       await self._ensure_stream()
+    except Exception as exc:
+      # Without its stream every JetStream publish fails, so this connection is
+      # no use. It is closed rather than kept: the caller retries with a new
+      # client, and one left open here would leak — a live socket and its own
+      # reconnect loop — on every attempt. Raised as the same ConnectionError a
+      # refused dial is, so the retry and the watchdog treat it as one.
+      await self._discard_client()
+      raise ConnectionError(
+        f"NATS at {self._config.url}: JetStream stream "
+        f"{self._config.stream_name} could not be set up: {type(exc).__name__}: {exc}"
+      ) from exc
+
+  async def _discard_client(self) -> None:
+    """Close the current client without reporting it as an outage."""
+    client, self._nc, self._js = self._nc, None, None
+    if client is None:
+      return
+    # nats-py awaits the disconnected callback inside close(); this flag keeps
+    # a connection dropped on purpose out of the operators' chat.
+    self._discarding = True
+    try:
+      await client.close()
+    except Exception as exc:
+      log.debug("Closing a discarded NATS client failed: %s", exc)
+    finally:
+      self._discarding = False
 
   def _start_connect_retry(self) -> None:
     if self._connect_retry_task is not None:
@@ -293,13 +328,31 @@ class NatsConnection:
       log.info("NATS connection closed")
 
   async def _ensure_stream(self) -> None:
-    """Create the stream if absent; never reconfigure one that exists."""
+    """Create the stream if absent; never reconfigure one that exists.
+
+    Only a stream the server says is **not there** is created. A read that
+    fails for any other reason — a timeout on a relayed link, which this
+    deployment sees several times an hour — leaves the question open, and
+    this returns rather than guessing: creating a stream blind would raise on
+    the one that already exists, and the caller discards the whole connection
+    over that. A stream that really is missing is reported by the first
+    publish instead.
+    """
     name = self._config.stream_name
     subjects = [f"{self._config.SUBJECT_PREFIX}.>"]
     try:
       info = await self.js.stream_info(name)
-    except Exception:
+    except NotFoundError:
       info = None
+    except Exception as exc:
+      log.warning(
+        "JetStream stream %s could not be read (%s); assuming it is there and "
+        "publishing to %s as configured",
+        name,
+        exc,
+        subjects[0],
+      )
+      return
     if info is not None:
       log.info("JetStream stream %s already exists", name)
       self._warn_stream_drift(info, subjects[0])
@@ -430,7 +483,7 @@ class NatsConnection:
   # ── Callbacks ─────────────────────────────────────────────────────
 
   async def _on_disconnected(self) -> None:
-    if self._closing:
+    if self._closing or self._discarding:
       return
     log.warning("NATS disconnected from %s", self._config.url)
     await self._notifier.send_message(
@@ -475,7 +528,7 @@ class NatsPublisher:
   def subject_for(self, event: MarketEvent) -> str:
     return ".".join((self._config.SUBJECT_PREFIX, *event.subject_tokens))
 
-  async def publish(self, event: MarketEvent) -> None:
+  async def publish(self, event: MarketEvent) -> bool:
     subject = self.subject_for(event)
     data = event.model_dump_json().encode()
     if self._config.JETSTREAM_ENABLED:
@@ -502,7 +555,7 @@ class NatsPublisher:
           ack.stream,
           ack.seq,
         )
-        return
+        return False
       log.info(
         "Published %s → %s (stream=%s seq=%s)",
         event.event_id,
@@ -513,4 +566,6 @@ class NatsPublisher:
     else:
       await self._connection.nc.publish(subject, data)
       log.info("Published %s → %s", event.event_id, subject)
-    log.debug("Published payload %s: %s", event.event_id, data.decode())
+    if log.isEnabledFor(logging.DEBUG):
+      log.debug("Published payload %s: %s", event.event_id, data.decode())
+    return True

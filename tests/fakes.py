@@ -18,11 +18,27 @@ class FakePublisher:
     self.subject_filter = "TEST.>"
     #: Raised instead of publishing while set, for the failure paths.
     self.fail_with: Exception | None = None
+    #: How many of the next attempts :attr:`fail_with` applies to, so a test
+    #: can let a retry through without racing the dispatcher. ``None`` leaves
+    #: it applying to every attempt.
+    self.fail_times: int | None = None
+    #: Returned by :meth:`publish` — ``False`` is a broker that acknowledged
+    #: the write and stored nothing, having seen this ``event_id`` already.
+    #: ``None`` models a publisher written against the signature before the
+    #: contract reported this, which the dispatcher must not read as a
+    #: duplicate.
+    self.stored: bool | None = True
+    #: Every attempt, failures included: what a retry is counted by.
+    self.attempts: list[MarketEvent] = []
 
-  async def publish(self, event: MarketEvent) -> None:
-    if self.fail_with is not None:
+  async def publish(self, event: MarketEvent) -> bool | None:
+    self.attempts.append(event)
+    if self.fail_with is not None and (self.fail_times is None or self.fail_times > 0):
+      if self.fail_times is not None:
+        self.fail_times -= 1
       raise self.fail_with
     self.events.append(event)
+    return self.stored
 
 
 class FakeNotifier:
@@ -124,17 +140,25 @@ class FakeKlineHistory:
   def __init__(self, rows: dict[tuple[str, str], list] | None = None) -> None:
     self.rows: dict[tuple[str, str], list] = dict(rows or {})
     self.calls: list[tuple[str, str, int]] = []
+    #: The ``end_time_ms`` of each call, in the same order as :attr:`calls`.
+    self.end_times: list[int | None] = []
     #: Raised by every :meth:`klines` call while it is set.
     self.error: Exception | None = None
 
   def set_rows(self, symbol: str, interval: str, rows: list) -> None:
     self.rows[(symbol, interval)] = list(rows)
 
-  async def klines(self, *, symbol: str, interval: str, limit: int) -> list:
+  async def klines(
+    self, *, symbol: str, interval: str, limit: int, end_time_ms: int | None = None
+  ) -> list:
     self.calls.append((symbol, interval, limit))
+    self.end_times.append(end_time_ms)
     if self.error is not None:
       raise self.error
-    return list(self.rows.get((symbol, interval), []))[-limit:]
+    rows = list(self.rows.get((symbol, interval), []))
+    if end_time_ms is not None:
+      rows = [row for row in rows if row[0] <= end_time_ms]
+    return rows[-limit:]
 
 
 class FakeKlineStream:

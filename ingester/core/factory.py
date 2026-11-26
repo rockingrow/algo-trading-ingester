@@ -37,6 +37,8 @@ class IngestionDependencies(TypedDict):
   publisher: EventPublisher
   notifier: Notifier
   instance_id: str
+  publish_attempts: int
+  publish_retry_delay: float
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,10 @@ class IngestionContext:
       "publisher": self.publisher,
       "notifier": self.notifier,
       "instance_id": self.settings.app.instance_id,
+      # How hard the dispatcher tries to get one bar out. It belongs to the
+      # transport, not to a venue, so it is the same for every gateway.
+      "publish_attempts": self.settings.nats.PUBLISH_RETRIES + 1,
+      "publish_retry_delay": self.settings.nats.PUBLISH_RETRY_DELAY,
     }
 
 

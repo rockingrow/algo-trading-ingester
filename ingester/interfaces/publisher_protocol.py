@@ -16,4 +16,13 @@ class EventPublisher(Protocol):
   @property
   def is_connected(self) -> bool: ...
 
-  async def publish(self, event: MarketEvent) -> None: ...
+  async def publish(self, event: MarketEvent) -> bool:
+    """Send *event*. ``True`` when the transport took it, ``False`` when it
+    acknowledged the write and stored nothing because it had this
+    ``event_id`` already — a bar no subscriber will be handed, which must not
+    be counted as one that was delivered.
+
+    Raise on a failure the caller may retry; the same event sent twice is
+    de-duplicated by ``event_id`` on the far side.
+    """
+    ...

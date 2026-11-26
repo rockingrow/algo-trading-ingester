@@ -73,10 +73,14 @@ def test_context_hands_builders_the_shared_dependencies(context):
     if name not in ("self", "config") and parameter.default is parameter.empty
   }
   dependencies = context.ingestion_dependencies()
-  assert set(dependencies) == required
+  assert required <= set(dependencies) <= set(parameters) - {"self", "config"}
   assert dependencies["publisher"] is context.publisher
   assert dependencies["notifier"] is context.notifier
   assert dependencies["instance_id"] == context.settings.app.instance_id
+  # Transport-wide, so every gateway retries a publish the same way.
+  nats = context.settings.nats
+  assert dependencies["publish_attempts"] == nats.PUBLISH_RETRIES + 1
+  assert dependencies["publish_retry_delay"] == nats.PUBLISH_RETRY_DELAY
 
 
 def test_the_same_builder_serves_every_market():

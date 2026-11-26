@@ -38,10 +38,13 @@ class KlineHistory(Protocol):
   """What the Binance gateway needs from the REST klines endpoint."""
 
   async def klines(
-    self, *, symbol: str, interval: str, limit: int
+    self, *, symbol: str, interval: str, limit: int, end_time_ms: int | None = None
   ) -> Sequence[Sequence[Any]]:
-    """The newest *limit* klines for a stream, oldest first — including the bar
-    still forming, which Binance always returns last.
+    """The newest *limit* klines for a stream, oldest first.
+
+    Without *end_time_ms* that includes the bar still forming, which Binance
+    always returns last. With it, only klines opening at or before that
+    millisecond — the page before one already read.
 
     Raise ``GatewayConnectionError`` when the endpoint cannot be read.
     """
@@ -61,9 +64,15 @@ class HttpKlineHistory:
     self._timeout = timeout
 
   async def klines(
-    self, *, symbol: str, interval: str, limit: int
+    self, *, symbol: str, interval: str, limit: int, end_time_ms: int | None = None
   ) -> Sequence[Sequence[Any]]:
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    params: dict[str, Any] = {
+      "symbol": symbol.upper(),
+      "interval": interval,
+      "limit": limit,
+    }
+    if end_time_ms is not None:
+      params["endTime"] = end_time_ms
     try:
       async with httpx.AsyncClient(timeout=self._timeout) as client:
         response = await client.get(self._url, params=params)

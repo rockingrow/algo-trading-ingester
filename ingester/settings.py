@@ -187,6 +187,16 @@ class NatsSettings(BaseSettings):
   #: subscriber that was down can replay it, de-duplicated by ``event_id``.
   JETSTREAM_ENABLED: bool = False
   PUBLISH_TIMEOUT: float = 5.0
+  #: Extra attempts at a publish that failed, before the bar is counted lost.
+  #: Retrying is safe by contract: ``event_id`` is the subscriber's
+  #: de-duplication key and JetStream's ``Nats-Msg-Id``, so the same bar
+  #: arriving twice is dropped on the other side — while a bar dropped here is
+  #: gone until a subscriber notices the gap and asks for history. Bounded,
+  #: because the queue behind the dispatcher is not: a NATS that stays down
+  #: has ``GIVE_UP_AFTER_ATTEMPTS`` to end the process instead.
+  PUBLISH_RETRIES: int = Field(default=2, ge=0)
+  #: Seconds between those attempts.
+  PUBLISH_RETRY_DELAY: float = Field(default=1.0, ge=0)
   #: How long the stream keeps a bar (only used when the stream is created).
   STREAM_MAX_AGE_SECONDS: float = 7 * 24 * 3600
   DUPLICATE_WINDOW_SECONDS: float = 120.0
@@ -373,6 +383,12 @@ class BinanceSettings(GatewaySettings):
   KLINES_URL: str = "https://api.binance.com/api/v3/klines"
   #: Seconds a single klines request may take.
   HTTP_TIMEOUT_SECONDS: float = 10.0
+  #: Seconds one history request may spend reading klines pages before it is
+  #: refused. More bars than one call returns (1000) are read page by page,
+  #: and the subscriber is waiting out ``NATS_HISTORY_TIMEOUT`` meanwhile:
+  #: keep this under that, so a read that cannot finish is refused with a
+  #: reason the caller can act on instead of leaving it to time out.
+  HISTORY_BUDGET_SECONDS: float = Field(default=15.0, gt=0)
   #: Seconds before a dropped socket is dialled again.
   RECONNECT_INTERVAL_SECONDS: float = 5.0
   #: Websocket keep-alive. Binance answers pings; a silent peer is dropped

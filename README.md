@@ -274,8 +274,12 @@ timeframe and emits the bars Binance marks closed.
 - **Start-up**: the socket only carries bars that close while it is connected,
   so the bars that closed before this process started are not published. A
   subscriber that needs them [asks](#history-requests) and is answered from the
-  REST endpoint at `klines_url` — at most 999 closed bars per request,
-  Binance's limit less the bar still forming, in any timeframe Binance has.
+  REST endpoint at `klines_url`, in any timeframe Binance has. Binance returns
+  at most 1000 rows per klines call, so a larger request is read page by page
+  up to `NATS_HISTORY_MAX_BARS`; the bar still forming is never included. A
+  read that cannot be finished inside `history_budget_seconds` is refused
+  rather than answered short, since a short reply reads as the whole of the
+  venue's history.
 - **De-duplication**: the newest open time emitted per stream is remembered, so
   a reconnect that replays a bar, or a repeated final update, publishes once.
 - **Reconnects**: Binance closes a connection after 24 hours, and a socket that
@@ -396,6 +400,13 @@ request it provokes always finds a responder. It is not persisted — a
 subscriber that was not listening learns the same thing by asking, since NATS
 answers *no responders* at once when no ingester is subscribed.
 
+**Treat it as idempotent.** A repeat carries nothing new: on a relayed link
+the connection drops several times an hour, and each one announces again with
+`reason: reconnected` while the ingester never stopped ingesting. Check which
+windows are actually short and ask only for those — a subscriber that
+re-requests every window on every announcement turns a flapping link into a
+stream of history requests, each one a venue read.
+
 What the ingester guarantees, and what it does not:
 
 - **One reply, whole or absent.** There is no series to reassemble and no
@@ -426,6 +437,27 @@ derived from the prefix rather than configured separately, so it can never
 drift from the subjects it has to carry. One stream and one subject tree carry
 every market: `market` and `gateway` tell a subscriber what it is looking at,
 so nothing downstream branches per venue.
+
+**A publish that fails is retried**, `NATS_PUBLISH_RETRIES` times,
+`NATS_PUBLISH_RETRY_DELAY` apart, before the bar is counted lost: the bar has
+already closed and is gone from the venue's push, so dropping it here leaves a
+hole until a subscriber notices and asks for history. The retry is safe
+because `event_id` is deterministic — a bar that did land after all is dropped
+by the stream, or by the subscriber, rather than traded twice. So the stream is
+**at-least-once with a de-duplication key**, not at-most-once, and a
+subscriber must de-duplicate on `event_id`. A publish the stream acknowledges
+and stores nothing for (it had that `event_id` already) is counted as
+`duplicates` on `/status`, never as `published`: no consumer is handed it, so
+`last_published_at` does not move for one either.
+
+**Which side de-duplicates depends on `NATS_JETSTREAM_ENABLED`.** With the
+stream on, the broker drops a repeat by `Nats-Msg-Id` and the ingester reports
+it. With it off — the default — nothing does, and the subscriber's `event_id`
+check is the only guard: a retry after a failure that was *ambiguous* (the
+publish reached the server, the acknowledgement did not) delivers the bar
+twice. `qte-ingest` de-duplicates, which is what the key is for; a subscriber
+that cannot wants `NATS_PUBLISH_RETRIES=0` and the at-most-once pipeline that
+comes with it.
 
 De-duplication only reaches back `NATS_DUPLICATE_WINDOW_SECONDS` (default
 `120`). The one time a gateway re-reads bars it may already have published is
@@ -562,6 +594,8 @@ The FastAPI server, logging, NATS, Telegram, which markets to run, and venue
 | `NATS_GIVE_UP_AFTER_ATTEMPTS`, `NATS_GIVE_UP_WINDOW_SECONDS` | `300`, `1800` | Failed attempts in that window after which the service stops itself and waits for an operator — `0` = never, see [Staying up](#staying-up) |
 | `NATS_JETSTREAM_ENABLED` | `false` | `false` = core NATS, fire-and-forget. `true` = persisted and de-duplicated |
 | `NATS_PUBLISH_TIMEOUT` | `5.0` | Seconds one JetStream publish ack may take |
+| `NATS_PUBLISH_RETRIES` | `2` | Extra attempts at a failed publish — safe: `event_id` de-duplicates |
+| `NATS_PUBLISH_RETRY_DELAY` | `1.0` | Seconds between those attempts |
 | `NATS_STREAM_MAX_AGE_SECONDS` | `604800` | Stream retention, 7 days. Set at creation only |
 | `NATS_DUPLICATE_WINDOW_SECONDS` | `120` | How far back JetStream de-duplicates on `event_id` — see [Delivery](#-nats-contract) |
 | `TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` | `false`, blank, blank | Status chat; ids comma-separated, `-100…_42` posts into a forum topic |
@@ -602,6 +636,7 @@ timeframes = ["M1", "M15", "H1"]
 ws_url = "wss://stream.binance.com:9443/stream"
 klines_url = "https://api.binance.com/api/v3/klines"   # history requests are answered from here
 http_timeout_seconds = 10.0
+history_budget_seconds = 15.0   # keep under NATS_HISTORY_TIMEOUT
 reconnect_interval_seconds = 5.0
 ping_interval_seconds = 20.0
 ping_timeout_seconds = 20.0

@@ -48,6 +48,7 @@ bars and answering no request until a restart.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from typing import Any
 
 from nats.aio.msg import Msg
@@ -103,18 +104,37 @@ class HistoryResponder:
     the same set.
     """
     self._ingestions = list(ingestions)
-    for ingestion in ingestions:
-      subject = self.subject_for(ingestion)
-      queue = self.queue_for(ingestion)
+    # Nothing would point at the subscriptions a previous start left, and they
+    # would go on answering: NATS delivers to both, and the queue group decides
+    # which, so a request would be served by a responder this object no longer
+    # knows it has. Unreachable through ``_on_connected``, which only starts
+    # when there are none — kept because the next caller of a public method
+    # should not have to know that.
+    await self._unsubscribe(self._subscriptions)
+    self._subscriptions = []
+    subscriptions: list[Any] = []
+    try:
+      for ingestion in ingestions:
+        subject = self.subject_for(ingestion)
+        queue = self.queue_for(ingestion)
 
-      async def handle(message: Msg, ingestion: Ingestion = ingestion) -> None:
-        await self._on_request(ingestion, message)
+        async def handle(message: Msg, ingestion: Ingestion = ingestion) -> None:
+          await self._on_request(ingestion, message)
 
-      subscription = await self._connection.nc.subscribe(
-        subject, queue=queue, cb=handle
-      )
-      self._subscriptions.append(subscription)
-      log.info("History requests served on %s (queue=%s)", subject, queue)
+        subscription = await self._connection.nc.subscribe(
+          subject, queue=queue, cb=handle
+        )
+        subscriptions.append(subscription)
+        log.info("History requests served on %s (queue=%s)", subject, queue)
+    except Exception:
+      # All or nothing. Kept, a part-subscribed responder is the worst of both:
+      # the announcement below names every gateway, and the reconnect hook
+      # takes its "already subscribed" branch, so the gateways that missed out
+      # are advertised as online for good while answering nothing — and a
+      # caller can only tell by timing out.
+      await self._unsubscribe(subscriptions)
+      raise
+    self._subscriptions = subscriptions
     # The server has to know about the subscriptions before anyone is told to
     # use them, or the first request an announcement provokes finds nobody.
     await self._connection.nc.flush()
@@ -163,12 +183,19 @@ class HistoryResponder:
   async def stop(self) -> None:
     self._ingestions = []
     subscriptions, self._subscriptions = self._subscriptions, []
+    await self._unsubscribe(subscriptions)
+
+  async def _unsubscribe(self, subscriptions: list[Any]) -> None:
+    """Drop *subscriptions*, whatever each one has to say about it.
+
+    A failure here is never worth raising: the caller is either shutting down,
+    where the connection's own close ends the subscription for good, or rolling
+    a failed start back, where the exception that started it is the one to
+    report.
+    """
     for subscription in subscriptions:
-      try:
+      with suppress(Exception):
         await subscription.unsubscribe()
-      except Exception as exc:
-        # Shutting down anyway; the connection's own close ends it for good.
-        log.debug("Unsubscribing from history requests failed: %s", exc)
 
   # ── One request ───────────────────────────────────────────────────
 

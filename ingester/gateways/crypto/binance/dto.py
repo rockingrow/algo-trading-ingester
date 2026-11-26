@@ -59,6 +59,17 @@ INTERVAL_TIMEFRAMES: dict[str, Timeframe] = {
   interval: timeframe for timeframe, interval in TIMEFRAME_INTERVALS.items()
 }
 
+#: How far past a REST row's close time this host's clock has to be before the
+#: row counts as a closed bar. REST carries no ``x`` flag, so closedness is
+#: read off the close time against our own clock — and the host running this
+#: service cannot sync NTP, so that clock drifts (see AGENTS.md). Without the
+#: allowance, a clock running a few seconds fast turns the candle that is
+#: still forming into a "closed" one and hands a strategy an unfinished bar.
+#: The cost is that a bar which closed inside the allowance is held back from
+#: a history reply until the next request; the websocket publishes its close
+#: either way.
+CLOSED_BAR_TOLERANCE_MS = 10_000
+
 
 class BinanceKlineDTO(BaseBarDTO):
   """One validated kline from a ``<symbol>@kline_<interval>`` stream.
@@ -97,8 +108,9 @@ class BinanceKlineDTO(BaseBarDTO):
 
     The symbol and interval are not in the row — they were the request — and
     neither is ``x``: REST returns the bar still forming like any other. It is
-    recognised by its close time, which Binance sets to the bar's last
-    millisecond, so a bar is closed exactly once *now* is past it.
+    told apart by its close time, which Binance sets to the bar's last
+    millisecond, so a row counts as closed once *now_ms* is at least
+    :data:`CLOSED_BAR_TOLERANCE_MS` past it.
     """
     if len(row) < 9:
       raise ValueError(f"Binance kline row has {len(row)} field(s), expected 9+")
@@ -115,7 +127,7 @@ class BinanceKlineDTO(BaseBarDTO):
       volume=row[5],
       quote_volume=row[7],
       trade_count=int(row[8]),
-      is_closed=close_time_ms < now_ms,
+      is_closed=close_time_ms + CLOSED_BAR_TOLERANCE_MS <= now_ms,
     )
 
   @property

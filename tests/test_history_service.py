@@ -73,11 +73,22 @@ class FakeIngestion:
 
 
 class FakeSubscription:
-  def __init__(self) -> None:
+  """A subscription that stops serving its subject once it is cancelled.
+
+  ``unsubscribe`` drops it from the connection, as the server's would: a test
+  can then read ``subscriptions`` as "what is being answered right now".
+  """
+
+  def __init__(self, nats: FakeNats | None = None, subject: str = "") -> None:
     self.unsubscribed = False
+    self._nats = nats
+    self._subject = subject
 
   async def unsubscribe(self) -> None:
     self.unsubscribed = True
+    if self._nats is not None:
+      self._nats.subscriptions.pop(self._subject, None)
+      self._nats.journal.append(f"unsubscribe {self._subject}")
 
 
 class FakeNats:
@@ -93,7 +104,7 @@ class FakeNats:
   async def subscribe(self, subject: str, queue: str = "", cb: Any = None):
     if self.fail_subscribe is not None:
       raise self.fail_subscribe
-    subscription = FakeSubscription()
+    subscription = FakeSubscription(self, subject)
     self.subscriptions[subject] = (queue, cb, subscription)
     self.journal.append(f"subscribe {subject}")
     return subscription
@@ -313,10 +324,29 @@ async def test_a_publish_with_no_reply_subject_is_ignored():
 async def test_stop_unsubscribes():
   responder, nats = make_responder()
   await responder.start([FakeIngestion()])
+  _, _, subscription = nats.subscriptions[SUBJECT]
+
   await responder.stop()
 
-  _, _, subscription = nats.subscriptions[SUBJECT]
   assert subscription.unsubscribed is True
+  # And the subject is no longer served, as the server would have it.
+  assert SUBJECT not in nats.subscriptions
+
+
+async def test_a_second_start_drops_what_the_first_one_subscribed():
+  # Nothing points at the earlier subscriptions once _subscriptions is
+  # replaced, and they keep answering: the queue group would hand requests to
+  # a responder this object no longer knows it has.
+  responder, nats = make_responder()
+  await responder.start([FakeIngestion()])
+  _, _, first = nats.subscriptions[SUBJECT]
+
+  await responder.start([FakeIngestion()])
+
+  assert first.unsubscribed is True
+  _, _, second = nats.subscriptions[SUBJECT]
+  assert second is not first
+  assert second.unsubscribed is False
 
 
 # ── Announcing itself ───────────────────────────────────────────────
@@ -419,3 +449,45 @@ async def test_nothing_is_announced_before_start_or_after_stop():
   await responder.stop()
   await connection.reconnect()
   assert len(nats.published) == 1
+
+
+async def test_a_start_that_fails_partway_subscribes_nothing():
+  """One gateway subscribed and the next refused is the worst of both.
+
+  The announcement names every gateway and the reconnect hook would take its
+  "already subscribed" branch, so a gateway that missed out would stay
+  advertised as online while answering nothing — and a caller could only tell
+  by timing out.
+  """
+
+  class SecondFails(FakeNats):
+    async def subscribe(self, subject: str, queue: str = "", cb: Any = None):
+      if "binance" in subject:
+        raise ConnectionError("nats: not connected")
+      return await super().subscribe(subject, queue=queue, cb=cb)
+
+  nats = SecondFails()
+  responder, _ = make_responder(nats)
+  mt5, binance = FakeIngestion(), FakeIngestion()
+  binance.gateway = GatewayEnum.BINANCE
+
+  with pytest.raises(ConnectionError):
+    await responder.start([mt5, binance])
+
+  # Nothing subscribed, nobody told anything is online.
+  assert nats.subscriptions == {}
+  assert nats.published == []
+
+  # The reconnect hook then puts the whole set in place, not the remainder.
+  plain = FakeNats()
+  responder._connection = FakeConnection(plain)
+  await responder._on_connected()
+
+  assert sorted(plain.subscriptions) == [
+    "INGESTER_RPC.history.binance.>",
+    "INGESTER_RPC.history.mt5.>",
+  ]
+  assert [subject for subject, _ in plain.published] == [
+    "INGESTER_RPC.online.mt5",
+    "INGESTER_RPC.online.binance",
+  ]
