@@ -106,6 +106,7 @@ def _format_gateway(gateway: dict[str, Any]) -> str:
   line += (
     f"\n      {symbols} | {timeframes}"
     f"\n      published {gateway.get('published', 0)},"
+    f" duplicates {gateway.get('duplicates', 0)},"
     f" failed {gateway.get('failed', 0)},"
     f" history {gateway.get('history_served', 0)} served"
     f"/{gateway.get('history_refused', 0)} refused"

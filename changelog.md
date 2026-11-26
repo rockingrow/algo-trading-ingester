@@ -34,6 +34,21 @@
   a thread still inside a venue call back up and leave two threads sharing one
   process-global MetaTrader5 session. The restart is refused instead, and the
   thread handle is kept so it can be.
+- **A duplicate no longer moves `last_published_at` either**, and `make status`
+  reports `duplicates` beside `published` as `/status` does. The timestamp is
+  what an operator reads to tell a quiet venue from a pipeline that stopped
+  delivering, so stamping it for a message no subscriber is handed hid the
+  failure it is there to show.
+- **Shutdown no longer spends the drain budget waiting to retry.**
+  `drain_timeout` is the budget for every bar still queued, and a publish that
+  failed sat out its whole `NATS_PUBLISH_RETRY_DELAY` inside it — so a stop
+  during a NATS outage flushed fewer bars than it had time for. The waits now
+  end when the drain begins and the remaining attempts run back to back.
+- **A second responder `start` drops what the first one subscribed.** Nothing
+  pointed at those subscriptions once the list was replaced, and they kept
+  answering: the queue group would hand a request to a responder the object no
+  longer knew it had. Not reachable through the reconnect hook, which only
+  starts when there are none.
 - **The `online` announcement is documented as idempotent.** It repeats on
   every reconnect — several times an hour on a relayed link — and carries
   nothing new; a subscriber that re-requests every window on each one turns a

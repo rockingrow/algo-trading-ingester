@@ -104,6 +104,14 @@ class HistoryResponder:
     the same set.
     """
     self._ingestions = list(ingestions)
+    # Nothing would point at the subscriptions a previous start left, and they
+    # would go on answering: NATS delivers to both, and the queue group decides
+    # which, so a request would be served by a responder this object no longer
+    # knows it has. Unreachable through ``_on_connected``, which only starts
+    # when there are none — kept because the next caller of a public method
+    # should not have to know that.
+    await self._unsubscribe(self._subscriptions)
+    self._subscriptions = []
     subscriptions: list[Any] = []
     try:
       for ingestion in ingestions:
@@ -124,9 +132,7 @@ class HistoryResponder:
       # takes its "already subscribed" branch, so the gateways that missed out
       # are advertised as online for good while answering nothing — and a
       # caller can only tell by timing out.
-      for subscription in subscriptions:
-        with suppress(Exception):
-          await subscription.unsubscribe()
+      await self._unsubscribe(subscriptions)
       raise
     self._subscriptions = subscriptions
     # The server has to know about the subscriptions before anyone is told to
@@ -177,12 +183,19 @@ class HistoryResponder:
   async def stop(self) -> None:
     self._ingestions = []
     subscriptions, self._subscriptions = self._subscriptions, []
+    await self._unsubscribe(subscriptions)
+
+  async def _unsubscribe(self, subscriptions: list[Any]) -> None:
+    """Drop *subscriptions*, whatever each one has to say about it.
+
+    A failure here is never worth raising: the caller is either shutting down,
+    where the connection's own close ends the subscription for good, or rolling
+    a failed start back, where the exception that started it is the one to
+    report.
+    """
     for subscription in subscriptions:
-      try:
+      with suppress(Exception):
         await subscription.unsubscribe()
-      except Exception as exc:
-        # Shutting down anyway; the connection's own close ends it for good.
-        log.debug("Unsubscribing from history requests failed: %s", exc)
 
   # ── One request ───────────────────────────────────────────────────
 

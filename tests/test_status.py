@@ -26,6 +26,7 @@ def payload(**overrides):
         "symbols": ["XAUUSD"],
         "timeframes": ["M5"],
         "published": 12,
+        "duplicates": 1,
         "failed": 0,
         "last_published_at": "2026-10-09T13:05:00+00:00",
         "last_error": None,
@@ -103,6 +104,9 @@ def test_a_healthy_service_reports_its_gateways(capsys):
   assert "connected" in out
   assert "forex/mt5" in out
   assert "XAUUSD" in out
+  # Counted apart from published on /status, and reported the same way here:
+  # a bar the broker already had was handed to no subscriber.
+  assert "published 12, duplicates 1, failed 0" in out
   assert "Degraded" not in out
   assert fetch.urls == ["http://127.0.0.1:8090/status"]
 

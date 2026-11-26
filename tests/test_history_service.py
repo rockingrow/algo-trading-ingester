@@ -333,6 +333,22 @@ async def test_stop_unsubscribes():
   assert SUBJECT not in nats.subscriptions
 
 
+async def test_a_second_start_drops_what_the_first_one_subscribed():
+  # Nothing points at the earlier subscriptions once _subscriptions is
+  # replaced, and they keep answering: the queue group would hand requests to
+  # a responder this object no longer knows it has.
+  responder, nats = make_responder()
+  await responder.start([FakeIngestion()])
+  _, _, first = nats.subscriptions[SUBJECT]
+
+  await responder.start([FakeIngestion()])
+
+  assert first.unsubscribed is True
+  _, _, second = nats.subscriptions[SUBJECT]
+  assert second is not first
+  assert second.unsubscribed is False
+
+
 # ── Announcing itself ───────────────────────────────────────────────
 
 ONLINE = "INGESTER_RPC.online.mt5"

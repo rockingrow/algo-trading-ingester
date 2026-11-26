@@ -447,7 +447,17 @@ by the stream, or by the subscriber, rather than traded twice. So the stream is
 **at-least-once with a de-duplication key**, not at-most-once, and a
 subscriber must de-duplicate on `event_id`. A publish the stream acknowledges
 and stores nothing for (it had that `event_id` already) is counted as
-`duplicates` on `/status`, never as `published`: no consumer is handed it.
+`duplicates` on `/status`, never as `published`: no consumer is handed it, so
+`last_published_at` does not move for one either.
+
+**Which side de-duplicates depends on `NATS_JETSTREAM_ENABLED`.** With the
+stream on, the broker drops a repeat by `Nats-Msg-Id` and the ingester reports
+it. With it off — the default — nothing does, and the subscriber's `event_id`
+check is the only guard: a retry after a failure that was *ambiguous* (the
+publish reached the server, the acknowledgement did not) delivers the bar
+twice. `qte-ingest` de-duplicates, which is what the key is for; a subscriber
+that cannot wants `NATS_PUBLISH_RETRIES=0` and the at-most-once pipeline that
+comes with it.
 
 De-duplication only reaches back `NATS_DUPLICATE_WINDOW_SECONDS` (default
 `120`). The one time a gateway re-reads bars it may already have published is

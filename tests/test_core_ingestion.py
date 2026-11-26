@@ -218,6 +218,57 @@ async def test_a_bar_the_broker_already_had_is_not_counted_as_published():
   assert (snapshot["published"], snapshot["failed"]) == (0, 0)
 
 
+async def test_a_duplicate_is_not_stamped_as_a_bar_that_was_delivered():
+  # last_published_at is what an operator reads to tell a quiet venue from a
+  # pipeline that stopped delivering. A duplicate reaches no subscriber, so
+  # stamping it hides exactly the failure the timestamp is there to show.
+  ingestion, _ = make_ingestion([])
+  ingestion._publisher.stored = False
+  await ingestion.start()
+  ingestion.emit_bar("BTCUSDT", M1, bar(60))
+  await wait_for(lambda: ingestion.snapshot()["duplicates"] == 1)
+  await ingestion.stop()
+
+  assert ingestion.snapshot()["last_published_at"] is None
+
+
+async def test_a_publisher_that_reports_nothing_is_not_read_as_a_duplicate():
+  # The publisher signature before the contract reported storage returned
+  # None. Read as "the broker already had it", every bar such a publisher
+  # delivers would be counted as one no subscriber was handed.
+  ingestion, _ = make_ingestion([])
+  ingestion._publisher.stored = None
+  await ingestion.start()
+  ingestion.emit_bar("BTCUSDT", M1, bar(60))
+  await wait_for(lambda: ingestion.snapshot()["published"] == 1)
+  await ingestion.stop()
+
+  snapshot = ingestion.snapshot()
+  assert snapshot["duplicates"] == 0
+  assert snapshot["last_published_at"] is not None
+
+
+async def test_shutdown_does_not_spend_the_drain_budget_waiting_to_retry():
+  # drain_timeout is the budget for every bar still queued. Spent waiting out
+  # one bar's retry delay, a shutdown during a NATS outage publishes fewer of
+  # them than it could — and the wait is already running when stop() is called.
+  ingestion, _ = make_ingestion(
+    [], publish_attempts=3, publish_retry_delay=30.0, drain_timeout=0.5
+  )
+  publisher = ingestion._publisher
+  await ingestion.start()
+  publisher.fail_with = ConnectionError("NATS is not connected")
+  ingestion.emit_bar("BTCUSDT", M1, bar(60))
+  await wait_for(lambda: publisher.attempts != [])
+
+  await ingestion.stop()
+
+  # Both remaining attempts ran, back to back, inside the drain — rather than
+  # the dispatcher still waiting out the first 30s delay when it gave up.
+  assert len(publisher.attempts) == 3
+  assert ingestion.snapshot()["failed"] == 1
+
+
 async def test_async_stream_is_running_on_the_first_frame_not_the_handshake():
   ingestion, _ = make_ingestion([])
   await ingestion.start()

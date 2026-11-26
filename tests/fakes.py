@@ -24,11 +24,14 @@ class FakePublisher:
     self.fail_times: int | None = None
     #: Returned by :meth:`publish` — ``False`` is a broker that acknowledged
     #: the write and stored nothing, having seen this ``event_id`` already.
-    self.stored = True
+    #: ``None`` models a publisher written against the signature before the
+    #: contract reported this, which the dispatcher must not read as a
+    #: duplicate.
+    self.stored: bool | None = True
     #: Every attempt, failures included: what a retry is counted by.
     self.attempts: list[MarketEvent] = []
 
-  async def publish(self, event: MarketEvent) -> bool:
+  async def publish(self, event: MarketEvent) -> bool | None:
     self.attempts.append(event)
     if self.fail_with is not None and (self.fail_times is None or self.fail_times > 0):
       if self.fail_times is not None:
